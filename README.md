@@ -2,7 +2,7 @@
 
 > **OpenCode / Claude Code** 技能：将本地视频/音频文件转录为高精度 SRT 字幕。
 
-输入视频或音频文件 → 提取音频 → faster-whisper 转写（词级时间戳）→ 可选润色 → 可选翻译 → 输出 SRT 字幕。
+输入视频或音频文件 → 提取音频 → Whisper 转写（词级时间戳，macOS 用 mlx-whisper / Windows 用 faster-whisper）→ 可选润色 → 可选翻译 → 输出 SRT 字幕。
 
 无需烧录、无需下载、不依赖任何 API，全程本地运行。
 
@@ -16,29 +16,20 @@ cd video-transcribe
 bash install.sh
 ```
 
-### 依赖
+### 平台依赖
 
+**macOS（Apple Silicon）**
+- `pip install mlx-whisper` — MLX + Metal GPU 加速
+- 模型首次运行自动从 HuggingFace 下载（约 1.5GB）
+
+**Windows / Linux**
+- `pip install faster-whisper` — CPU + int8 量化
+- 模型首次运行自动从 HuggingFace 下载（约 1.5GB）
+- 建议 16GB+ 内存
+
+**通用**
 - **ffmpeg** — 音频提取
-- **faster-whisper** — 转写引擎（`pip install faster-whisper`）
-- **Python 3.8+**
-
-首次运行自动从 HuggingFace 下载模型（large-v3-turbo ≈ 3GB）。
-
-### macOS Apple Silicon（可选加速）
-
-```bash
-pip install mlx-whisper
-```
-
-脚本自动检测并使用 MLX + Metal GPU 加速。
-
-### Windows
-
-```bash
-pip install faster-whisper
-```
-
-使用 CPU + int8 量化，建议 16GB+ 内存。
+- **Python 3.8+
 
 ### npx
 
@@ -69,7 +60,7 @@ output subtitles /path/to/audio.wav
 技能会自动执行：
 
 1. **提取音频** — 用 ffmpeg 提取 MP3
-2. **转写** — faster-whisper 生成带词级时间戳的原始 SRT
+2. **转写** — Whisper 生成带词级时间戳的原始 SRT（macOS → mlx-whisper，Windows → faster-whisper）
 3. **[可选] 润色** — 如已安装 `srt-enhancer` 技能，询问是否调用
 4. **[可选] 翻译** — 非中文内容询问翻译模式（纯中文 / 中上原下 / 原上中下）
 5. **输出** — 最终 SRT 到 `output_dir/data/`
