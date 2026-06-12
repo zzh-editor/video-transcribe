@@ -33,7 +33,6 @@ bash install.sh
 - **funasr** — `pip install funasr`（自动安装 PyTorch 等）
 - 模型首次运行自动下载（约 3GB）
 
-=======
 
 ### npx
 
@@ -77,7 +76,7 @@ generate subtitles /path/to/video.mkv
 5. **输出** — 最终 SRT 到 `output_dir/data/`
 
 ### 指定语种
-=======
+
 1. 用户提供本地视频或音频文件路径
 2. 提取音频（ffmpeg → 16kHz WAV）
 3. FunASR 转写 → VAD 句子级时间戳 → 文本后处理断句
@@ -107,7 +106,7 @@ video-transcribe/
 ## 配置
 
 编辑 `config.json` 设置：
-=======
+
 编辑 `config.json`：
 
 ```json
@@ -138,7 +137,6 @@ video-transcribe/
 - 多级输出解析：`sentence_info` → `timestamp+text` → `text only`
 - 31 种语言/方言自动检测
 
----
 =======
   "vad": true
 }
@@ -149,7 +147,8 @@ video-transcribe/
 | output_dir | `~/Documents/video-transcribe-output` | 转录产物输出目录 |
 | model | `FunAudioLLM/Fun-ASR-Nano-2512` | FunASR 模型名称 |
 | vad | `true` | 是否启用 VAD 切分 |
->>>>>>> b6fa199 (refactor: migrate Whisper to FunASR with enhanced sentence segmentation)
+=======
+
 
 ## License
 
