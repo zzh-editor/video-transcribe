@@ -1,9 +1,13 @@
 {
   "output_dir": "~/Documents/video-transcribe-output",
   "model": "FunAudioLLM/Fun-ASR-Nano-2512",
+<<<<<<< HEAD
   "vad": {
     "max_single_segment_time": 60000
   },
+=======
+  "vad": true,
+>>>>>>> b6fa199 (refactor: migrate Whisper to FunASR with enhanced sentence segmentation)
   "__ui": {
     "fields": {
       "output_dir": {
@@ -12,8 +16,22 @@
         "required": true,
         "description": "转录产物的输出目录。转录出的 SRT 文件写入此目录。",
         "placeholder": "请选择输出目录…"
+      },
+      "model": {
+        "label": "模型",
+        "type": "string",
+        "required": false,
+        "description": "FunASR 模型名称，默认 FunAudioLLM/Fun-ASR-Nano-2512",
+        "placeholder": "FunAudioLLM/Fun-ASR-Nano-2512"
+      },
+      "vad": {
+        "label": "VAD 切分",
+        "type": "boolean",
+        "required": false,
+        "description": "是否启用语音活动检测（VAD）按句子切分",
+        "default": true
       }
     },
-    "order": ["output_dir"]
+    "order": ["output_dir", "model", "vad"]
   }
 }

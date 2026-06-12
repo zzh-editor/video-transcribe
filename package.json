@@ -1,8 +1,13 @@
 {
   "name": "video-transcribe",
   "version": "2.0.0",
+<<<<<<< HEAD
   "description": "OpenCode / Claude Code skill: transcribe video/audio to SRT subtitles with FunASR",
   "keywords": ["opencode", "claude-code", "funasr", "subtitle", "transcribe", "srt"],
+=======
+  "description": "OpenCode / Claude Code skill: transcribe video/audio to SRT subtitles using FunASR (Fun-ASR-Nano) with VAD sentence timestamps",
+  "keywords": ["opencode", "claude-code", "funasr", "asr", "subtitle", "transcribe", "srt", "nano"],
+>>>>>>> b6fa199 (refactor: migrate Whisper to FunASR with enhanced sentence segmentation)
   "author": "zzh-editor",
   "license": "MIT",
   "bin": {
