@@ -137,7 +137,6 @@ video-transcribe/
 - 多级输出解析：`sentence_info` → `timestamp+text` → `text only`
 - 31 种语言/方言自动检测
 
-=======
   "vad": true
 }
 ```
@@ -147,7 +146,6 @@ video-transcribe/
 | output_dir | `~/Documents/video-transcribe-output` | 转录产物输出目录 |
 | model | `FunAudioLLM/Fun-ASR-Nano-2512` | FunASR 模型名称 |
 | vad | `true` | 是否启用 VAD 切分 |
-=======
 
 
 ## License
