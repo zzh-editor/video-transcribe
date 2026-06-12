@@ -1,8 +1,8 @@
 {
   "name": "video-transcribe",
-  "version": "1.0.0",
-  "description": "OpenCode / Claude Code skill: transcribe video/audio to SRT subtitles with word-level timestamps",
-  "keywords": ["opencode", "claude-code", "whisper", "subtitle", "transcribe", "srt"],
+  "version": "2.0.0",
+  "description": "OpenCode / Claude Code skill: transcribe video/audio to SRT subtitles with FunASR",
+  "keywords": ["opencode", "claude-code", "funasr", "subtitle", "transcribe", "srt"],
   "author": "zzh-editor",
   "license": "MIT",
   "bin": {

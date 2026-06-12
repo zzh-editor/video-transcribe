@@ -23,7 +23,7 @@ mkdir -p "$TARGET/scripts"
 cp "$SOURCE/SKILL.md" "$TARGET/SKILL.md"
 
 # Copy scripts
-cp "$SOURCE/scripts/transcribe_srt.py" "$TARGET/scripts/transcribe_srt.py"
+cp "$SOURCE/scripts/transcribe.py" "$TARGET/scripts/transcribe.py"
 
 # Copy config.example.json -> config.json if not exists
 if [ ! -f "$TARGET/config.json" ]; then
