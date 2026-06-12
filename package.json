@@ -1,0 +1,20 @@
+{
+  "name": "video-transcribe",
+  "version": "1.0.0",
+  "description": "OpenCode / Claude Code skill: transcribe video/audio to SRT subtitles with word-level timestamps",
+  "keywords": ["opencode", "claude-code", "whisper", "subtitle", "transcribe", "srt"],
+  "author": "zzh-editor",
+  "license": "MIT",
+  "bin": {
+    "video-transcribe": "install.sh"
+  },
+  "scripts": {
+    "postinstall": "bash install.sh"
+  },
+  "files": [
+    "SKILL.md",
+    "scripts/",
+    "config.example.json",
+    "install.sh"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "output_dir": "~/Documents/video-transcribe-output",
+  "__ui": {
+    "fields": {
+      "output_dir": {
+        "label": "输出目录",
+        "type": "directory",
+        "required": true,
+        "description": "转录产物的输出目录。转录出的 SRT 文件写入此目录。",
+        "placeholder": "请选择输出目录…"
+      }
+    },
+    "order": ["output_dir"]
+  }
+}
