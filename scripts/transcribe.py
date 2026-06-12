@@ -1,55 +1,68 @@
 #!/usr/bin/env python3
 """
-<<<<<<< HEAD
-Transcribe audio to SRT using FunASR AutoModel (Fun-ASR-Nano + VAD + punctuation).
+Transcribe audio to SRT using Whisper with word-level timestamp segmentation.
+
+Segmentation priority (3-layer + post-process):
+
+  Layer 1 — Strong boundaries (immediate split):
+    · Sentence-ending punctuation (。？！.?!…)
+    · Protected single-word responses with significant surrounding pause
+      (好/对/OK/yes/no 等 → keep as independent subtitle)
+    · Natural pause ≥ threshold (300ms zh/ja/ko, 500ms others)
+
+  Layer 2 — Soft splitting for over-length blocks (>max_line_ms or >max_chars):
+    a. Last comma/conjunction within first max_chars
+    b. Largest word-gap in latter 2/3 of the block
+    c. Fallback: even character split
+
+  Layer 3 — Smart merging of short fragments:
+    · Merge short (<0.4s, <3 words) into previous block
+    · Skip merge if fragment is a protected response word
+
+  Post-process:
+    · Drop invalid timestamps (end <= start)
+    · Deduplicate consecutive identical text (Whisper repeat artifact)
+    · Fix time overlaps between adjacent blocks
 
 Usage:
-    python3 scripts/transcribe.py <audio.wav> [--output <raw.srt>] [--language zh] [--device cpu]
-
-Requires: pip install funasr
-=======
-Transcribe audio/video to SRT using FunASR AutoModel (Fun-ASR-Nano + VAD + punctuation).
-
-Usage:
-    python3 transcribe.py <audio/video_file> [--output <srt_path>] [--config <config.json>]
-
-Arguments:
-    audio/video_file     input media file (any ffmpeg-supported format)
-    --output, -o         output SRT path (default: <input>.srt)
-    --config, -c         path to config.json (for output_dir etc.)
-    --model              FunASR model name (default: FunAudioLLM/Fun-ASR-Nano-2512)
-    --device             device: cpu (default), mps, cuda
-    --max-line-duration  max seconds per subtitle line (default: 8.0)
-    --max-line-chars     max characters per subtitle line (default: 80)
-    --min-line-duration  min seconds before merging short fragments (default: 1.5)
->>>>>>> b6fa199 (refactor: migrate Whisper to FunASR with enhanced sentence segmentation)
+    python3 scripts/transcribe.py <audio.wav> [options]
 """
 
 import argparse
-import json
-<<<<<<< HEAD
-import sys
-from pathlib import Path
-
-
-=======
 import os
-import subprocess
+import platform
 import sys
-import tempfile
+import time
 from pathlib import Path
 
 
-def extract_audio(input_path: str, output_wav: str):
-    print(f"extracting audio: {input_path} -> {output_wav}", file=sys.stderr)
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", input_path, "-vn", "-acodec", "pcm_s16le",
-         "-ar", "16000", "-ac", "1", output_wav],
-        check=True, capture_output=True, text=True
-    )
+# ── Constants ──────────────────────────────────────────────────────
+
+SENTENCE_END = frozenset(".?!。？！…")
+SOFT_BREAK = frozenset(",;:，；：、—")
+CONJUNCTIONS = [
+    "然后", "所以", "但是", "不过", "而且", "另外", "还有", "接下来",
+    "but", "and", "so", "however", "then", "because", "also",
+]
+
+# Single-word/character responses that should be kept as independent
+# subtitle blocks when isolated by significant pauses.
+PROTECTED_WORDS = frozenset({
+    # Chinese single-char
+    "好", "对", "嗯", "嗯", "是", "不", "行", "哦", "啊", "呀", "喏",
+    "嗯哼",
+    # Chinese multi-char
+    "好的", "对的", "明白", "知道", "可以", "没错", "是的", "不行",
+    "好吧", "对了", "对哦", "对啊", "嗯嗯", "好啦", "行了", "可以啊",
+    "没问题", "没事", "知道了", "明白了", "没关系",
+    # English
+    "ok", "okay", "yes", "no", "right", "sure", "yeah", "yep",
+    "nope", "nah", "alright", "indeed",
+})
 
 
->>>>>>> b6fa199 (refactor: migrate Whisper to FunASR with enhanced sentence segmentation)
+# ── Helpers ────────────────────────────────────────────────────────
+
 def format_timestamp(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -58,94 +71,366 @@ def format_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-<<<<<<< HEAD
-def extract_segments(result):
-    """
-    Extract timed segments from FunASR result, handling various output formats.
+def get_pause_threshold(language: str | None) -> float:
+    if language and language.startswith(("zh", "ja", "ko")):
+        return 0.3
+    return 0.5
 
-    Returns list of {"start": float, "end": float, "text": str}.
-    """
-    if isinstance(result, list):
-        result = result[0] if result else {}
-    if not isinstance(result, dict):
+
+def _strip_punct(text: str) -> str:
+    return text.strip().lower().rstrip(",.?!。？！，、；:\"'").strip()
+
+
+def is_protected(text: str) -> bool:
+    return _strip_punct(text) in PROTECTED_WORDS
+
+
+def should_isolate(word_text: str, gap_before: float, gap_after: float,
+                   pause_threshold: float) -> bool:
+    """True if a protected word should stand alone as its own subtitle block."""
+    base = _strip_punct(word_text)
+    if base not in PROTECTED_WORDS:
+        return False
+    return gap_before >= pause_threshold or gap_after >= pause_threshold
+
+
+def get_model_path() -> str:
+    skill_dir = Path(__file__).resolve().parent.parent
+    models_dir = skill_dir / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    return str(models_dir)
+
+
+# ── Word data ──────────────────────────────────────────────────────
+
+class Word:
+    __slots__ = ("start", "end", "word", "probability")
+    def __init__(self, start: float, end: float, word: str, probability: float = 1.0):
+        self.start = start
+        self.end = end
+        self.word = word
+        self.probability = probability
+
+
+# ── Word extraction ────────────────────────────────────────────────
+
+def extract_words(segments: list) -> list[Word]:
+    flat: list[Word] = []
+    for seg in segments:
+        if isinstance(seg, dict):
+            words = seg.get("words", [])
+        else:
+            words = getattr(seg, "words", None) or []
+        if not words:
+            continue
+        for w in words:
+            if isinstance(w, dict):
+                flat.append(Word(
+                    w.get("start", 0.0),
+                    w.get("end", 0.0),
+                    w.get("word", ""),
+                    w.get("probability", 1.0),
+                ))
+            else:
+                flat.append(Word(
+                    getattr(w, "start", 0.0),
+                    getattr(w, "end", 0.0),
+                    getattr(w, "word", ""),
+                    getattr(w, "probability", 1.0),
+                ))
+    return flat
+
+
+# ── Segmentation (Layer 1 + Layer 2) ──────────────────────────────
+
+def find_soft_cut(words: list[Word], max_chars: int) -> int | None:
+    """Find last soft-break position (comma/conjunction) within max_chars."""
+    best = None
+    for i, w in enumerate(words):
+        if sum(len(x.word) for x in words[:i + 1]) > max_chars:
+            break
+        t = w.word.strip()
+        if t and t[-1] in SOFT_BREAK:
+            best = i
+    if best is not None:
+        return best
+    # Try conjunctions
+    for conj in CONJUNCTIONS:
+        for i, w in enumerate(words):
+            if w.word.strip().startswith(conj) and i > 0:
+                return i - 1
+    return None
+
+
+def find_pause_cut(words: list[Word]) -> int | None:
+    """Largest gap in latter 2/3 of the block."""
+    best_gap, best_j = 0.2, None
+    start = max(1, len(words) // 3)
+    for j in range(start, len(words) - 1):
+        gap = words[j + 1].start - words[j].end
+        if gap > best_gap:
+            best_gap, best_j = gap, j
+    return best_j
+
+
+def merge_words_to_segments(words: list[Word], *,
+                            max_line_ms: int = 6000,
+                            pause_threshold: float = 0.3,
+                            max_chars: int = 40) -> list[dict]:
+    if not words:
         return []
 
-    sentence_info = result.get("sentence_info", [])
-    if sentence_info and isinstance(sentence_info, list):
-        segments = []
-        for s in sentence_info:
-            text = s.get("text", "").strip()
-            if text:
-                segments.append({
-                    "start": s.get("start", 0.0),
-                    "end": s.get("end", 0.0),
-                    "text": text,
-                })
-        if segments:
-            return segments
+    n = len(words)
+    result: list[dict] = []
+    cur: list[Word] = []
 
-    text = result.get("text", "").strip()
-    timestamp = result.get("timestamp", []) or result.get("ts_list", [])
-    if text and timestamp:
-        return [
-            {"start": ts[0], "end": ts[1], "text": w}
-            for ts, w in zip(timestamp, text.split())
-            if len(ts) >= 2
-        ]
+    for i, w in enumerate(words):
+        wtext = w.word.strip()
+        if not wtext:
+            cur.append(w)
+            continue
 
-    if text:
-        return [{"start": 0.0, "end": 0.0, "text": text}]
+        gap_after = words[i + 1].start - w.end if i + 1 < n else 999.0
+        gap_before = w.start - words[i - 1].end if i > 0 else 0.0
 
-    return []
+        # Layer 1a: Protected word at start of new block → isolate immediately
+        if not cur and should_isolate(wtext, gap_before, gap_after, pause_threshold):
+            result.append({"start": w.start, "end": w.end, "text": wtext})
+            continue
+
+        cur.append(w)
+
+        # Build current accumulated text, stripping empty-word artifacts
+        cur_text = "".join(x.word for x in cur).replace(" ", "").strip()
+        cur_text = cur_text.replace("\u200b", "")
+        cur_start = cur[0].start
+        cur_end = cur[-1].end
+        cur_dur = cur_end - cur_start
+        cur_char_len = max(len(cur_text.replace(" ", "")), len("".join(x.word.strip() for x in cur if x.word.strip())))
+
+        # Layer 1b: Sentence-ending punctuation → split
+        if wtext[-1] in SENTENCE_END:
+            result.append({"start": cur_start, "end": cur_end, "text": cur_text})
+            cur = []
+            continue
+
+        # Layer 1c: Protected word as only accumulated item with pause after it
+        if len(cur) == 1 and gap_after >= pause_threshold and is_protected(wtext):
+            result.append({"start": cur_start, "end": cur_end, "text": cur_text})
+            cur = []
+            continue
+
+        # Layer 1d: Big pause after ≥2 words → split
+        if gap_after >= pause_threshold and len(cur) >= 2:
+            result.append({"start": cur_start, "end": cur_end, "text": cur_text})
+            cur = []
+            continue
+
+        # Layer 2: Over-length → soft cut
+        if cur_dur >= max_line_ms / 1000 or cur_char_len >= max_chars:
+            cut = find_soft_cut(cur, max_chars)
+            if cut is not None and cut < len(cur) - 1:
+                head = cur[:cut + 1]
+                cur = cur[cut + 1:]
+                ht = "".join(x.word for x in head).replace("\u200b", "").strip()
+                result.append({"start": head[0].start, "end": head[-1].end, "text": ht})
+                continue
+
+            cut = find_pause_cut(cur)
+            if cut is not None and cut < len(cur) - 1:
+                head = cur[:cut + 1]
+                cur = cur[cut + 1:]
+                ht = "".join(x.word for x in head).replace("\u200b", "").strip()
+                result.append({"start": head[0].start, "end": head[-1].end, "text": ht})
+                continue
+
+            # Fallback: even split at approximate midpoint
+            mid = len(cur) // 2
+            head = cur[:mid]
+            cur = cur[mid:]
+            ht = "".join(x.word for x in head).replace("\u200b", "").strip()
+            result.append({"start": head[0].start, "end": head[-1].end, "text": ht})
+
+    if cur:
+        ct = "".join(x.word for x in cur).replace("\u200b", "").strip()
+        if ct:
+            result.append({"start": cur[0].start, "end": cur[-1].end, "text": ct})
+
+    return result
 
 
-def transcribe(audio_path: str, output_path: str, language: str = None,
-               device: str = "cpu", vad_config: dict = None):
-    from funasr import AutoModel
+# ── Post-processing (Layer 3) ─────────────────────────────────────
 
-    print(f"model: Fun-ASR-Nano", file=sys.stderr)
-    print(f"device: {device}", file=sys.stderr)
+def postprocess(segments: list[dict]) -> list[dict]:
+    if not segments:
+        return []
+
+    # Phase 1: Drop invalid + deduplicate consecutive identical text
+    cleaned: list[dict] = []
+    for seg in segments:
+        if seg["end"] <= seg["start"]:
+            continue
+        text = seg["text"]
+        if cleaned and text == cleaned[-1]["text"]:
+            cleaned[-1]["end"] = max(cleaned[-1]["end"], seg["end"])
+            continue
+        cleaned.append(seg)
+
+    # Phase 2: Smart merge short fragments (not protected response words)
+    merged: list[dict] = []
+    for seg in cleaned:
+        duration = seg["end"] - seg["start"]
+        word_count = seg["text"].count(" ") + 1
+        is_short = duration < 0.4 and word_count < 3
+        if merged and is_short and not is_protected(seg["text"]):
+            merged[-1]["end"] = seg["end"]
+            sep = "" if seg["text"][:1] in "，、。？！" else ""
+            merged[-1]["text"] = merged[-1]["text"].rstrip("，、；：") + sep + seg["text"]
+        else:
+            merged.append(seg)
+
+    # Phase 3: Fix time overlaps
+    for k in range(1, len(merged)):
+        prev_end = merged[k - 1]["end"]
+        if merged[k]["start"] < prev_end:
+            gap = merged[k]["end"] - prev_end
+            if gap > 0.01:
+                merged[k]["start"] = prev_end
+            else:
+                merged[k] = dict(merged[k], start=prev_end + 0.01,
+                                 end=prev_end + 0.3)
+
+    return merged
+
+
+# ── Transcribe backends ────────────────────────────────────────────
+
+def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
+                   max_line_length: int, pause_threshold: float,
+                   max_line_ms: int) -> list[dict]:
+    import mlx_whisper
+
+    models_dir = get_model_path()
+    os.environ.setdefault("HF_HOME", models_dir)
+    os.environ.setdefault("XDG_CACHE_HOME", str(Path(models_dir) / "cache"))
+
+    print(f"engine: mlx-whisper", file=sys.stderr)
+    print(f"model: {model_name}", file=sys.stderr)
+    print(f"device: Apple Silicon (MLX)", file=sys.stderr)
     print(f"transcribing: {audio_path}", file=sys.stderr)
 
-    kwargs = {
-        "model": "FunAudioLLM/Fun-ASR-Nano-2512",
-        "vad_model": "fsmn-vad",
-        "punc_model": "ct-punc",
-        "device": device,
-    }
-    if vad_config:
-        kwargs["vad_kwargs"] = vad_config
-    if language:
-        kwargs["language"] = language
+    t0 = time.time()
+    result = mlx_whisper.transcribe(
+        audio_path,
+        path_or_hf_repo=model_name,
+        language=language,
+        word_timestamps=True,
+    )
+    elapsed = time.time() - t0
+    print(f"transcription took {elapsed:.1f}s", file=sys.stderr)
 
-    model = AutoModel(**kwargs)
-    result = model.generate(input=audio_path)
-
-    segments = extract_segments(result)
+    segments = result.get("segments", [])
     if not segments:
-        print("error: no transcription segments extracted", file=sys.stderr)
-        print(f"raw result: {json.dumps(result, default=str, ensure_ascii=False)[:500]}", file=sys.stderr)
+        print("error: no segments in mlx-whisper output", file=sys.stderr)
         sys.exit(1)
 
+    raw_count = len(segments)
+    words = extract_words(segments)
+    out = merge_words_to_segments(
+        words,
+        max_line_ms=max_line_ms,
+        pause_threshold=pause_threshold,
+        max_chars=max_line_length,
+    )
+    out = postprocess(out)
+
+    print(f"segments: {raw_count} raw Whisper segs → {len(out)} word-timestamp merged",
+          file=sys.stderr)
+    return out
+
+
+def transcribe_faster(audio_path: str, model_name: str, language: str | None,
+                      max_line_length: int, pause_threshold: float,
+                      max_line_ms: int) -> list[dict]:
+    from faster_whisper import WhisperModel
+
+    models_dir = get_model_path()
+    os.environ.setdefault("HF_HOME", models_dir)
+
+    print(f"engine: faster-whisper", file=sys.stderr)
+    print(f"model: {model_name}", file=sys.stderr)
+    print(f"device: CPU", file=sys.stderr)
+    print(f"transcribing: {audio_path}", file=sys.stderr)
+
+    t0 = time.time()
+    model = WhisperModel(model_name, device="cpu", compute_type="int8",
+                         download_root=models_dir)
+    seg_iter, info = model.transcribe(audio_path, language=language,
+                                      word_timestamps=True)
+    elapsed = time.time() - t0
+    print(f"transcription took {elapsed:.1f}s", file=sys.stderr)
+    print(f"detected language: {info.language}", file=sys.stderr)
+
+    raw_segments = list(seg_iter)
+    raw_count = len(raw_segments)
+
+    if raw_segments and hasattr(raw_segments[0], 'words') and raw_segments[0].words:
+        words = extract_words(raw_segments)
+    else:
+        words = []
+        for seg in raw_segments:
+            if seg.text.strip():
+                words.append(Word(seg.start, seg.end, seg.text.strip()))
+
+    out = merge_words_to_segments(
+        words,
+        max_line_ms=max_line_ms,
+        pause_threshold=pause_threshold,
+        max_chars=max_line_length,
+    )
+    out = postprocess(out)
+
+    print(f"segments: {raw_count} raw Whisper segs → {len(out)} word-timestamp merged",
+          file=sys.stderr)
+    return out
+
+
+# ── SRT writer ─────────────────────────────────────────────────────
+
+def write_srt(segments: list[dict], output_path: str):
     with open(output_path, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, 1):
             f.write(f"{i}\n")
             f.write(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}\n")
             f.write(f"{seg['text']}\n\n")
 
-    print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
-    return output_path
 
+# ── Platform detection ─────────────────────────────────────────────
+
+def detect_platform() -> dict:
+    return {"is_macos": sys.platform == "darwin",
+            "is_arm": platform.machine() == "arm64"}
+
+
+# ── Main ───────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Transcribe audio to SRT using FunASR")
+    parser = argparse.ArgumentParser(
+        description="Transcribe audio to SRT using Whisper with word-level timestamp segmentation"
+    )
     parser.add_argument("audio", help="audio file path (WAV 16kHz mono)")
     parser.add_argument("--output", "-o", help="output SRT path")
-    parser.add_argument("--language", "-l", help="language code (default: auto-detect)")
-    parser.add_argument("--device", "-d", default="cpu", choices=["cpu", "mps", "cuda"],
-                        help="compute device (default: cpu)")
-    parser.add_argument("--vad-config", type=json.loads, default=None,
-                        help='VAD kwargs JSON, e.g. \'{"max_single_segment_time": 60000}\'')
+    parser.add_argument("--language", "-l", help="language code (e.g. zh, en)")
+    parser.add_argument("--model", "-m", default=None,
+                        help="model name (default: auto-select based on platform)")
+    parser.add_argument("--max-line-length", type=int, default=40,
+                        help="max characters per subtitle line (default: 40)")
+    parser.add_argument("--max-line-ms", type=int, default=6000,
+                        help="max duration per subtitle block in ms (default: 6000)")
+    parser.add_argument("--pause-ms", type=int, default=None,
+                        help="pause threshold for sentence split in ms (default: 300 zh / 500 en)")
+    parser.add_argument("--engine", choices=["auto", "mlx", "faster-whisper"],
+                        default="auto", help="force a specific engine")
 
     args = parser.parse_args()
 
@@ -156,361 +441,40 @@ def main():
 
     output_path = args.output or str(audio_path.with_suffix(".srt"))
 
-    transcribe(
-        str(audio_path),
-        output_path,
-        language=args.language,
-        device=args.device,
-        vad_config=args.vad_config,
-    )
-=======
-SENTENCE_END = ".?!。？！…"
-SOFT_BREAK = ",;:，；：、—"
+    lang = args.language
+    pause_threshold = (args.pause_ms / 1000.0) if args.pause_ms is not None else get_pause_threshold(lang)
 
+    plat = detect_platform()
 
-class Segment:
-    def __init__(self, start: float, end: float, text: str):
-        self.start = start
-        self.end = end
-        self.text = text
-
-
-def _is_sentence_end(char: str) -> bool:
-    return char in SENTENCE_END
-
-
-def _is_soft_break(char: str) -> bool:
-    return char in SOFT_BREAK
-
-
-def _approx_timestamp(char_index: int, total_chars: int, seg_start: float, seg_end: float) -> float:
-    if total_chars <= 1:
-        return seg_start
-    ratio = char_index / total_chars
-    return seg_start + ratio * (seg_end - seg_start)
-
-
-def _split_by_punctuation(seg: Segment) -> list[Segment]:
-    text = seg.text.strip()
-    if not text:
-        return []
-    total = len(text)
-    if total <= 1:
-        return [Segment(seg.start, seg.end, text)]
-
-    result = []
-    last_cut = 0
-    for i, ch in enumerate(text):
-        if _is_sentence_end(ch):
-            piece = text[last_cut:i + 1].strip()
-            if piece:
-                start_ts = _approx_timestamp(last_cut, total, seg.start, seg.end)
-                end_ts = _approx_timestamp(i + 1, total, seg.start, seg.end)
-                result.append(Segment(start_ts, end_ts, piece))
-            last_cut = i + 1
-
-    remaining = text[last_cut:].strip()
-    if remaining:
-        start_ts = _approx_timestamp(last_cut, total, seg.start, seg.end)
-        result.append(Segment(start_ts, seg.end, remaining))
-
-    if not result:
-        result.append(Segment(seg.start, seg.end, text))
-
-    return result
-
-
-def _split_long_segment(seg: Segment, max_duration: float, max_chars: int) -> list[Segment]:
-    text = seg.text.strip()
-    if not text:
-        return []
-    duration = seg.end - seg.start
-    total = len(text)
-
-    if duration <= max_duration and total <= max_chars:
-        return [seg]
-
-    result = []
-    last_cut = 0
-    total_chars = len(text)
-
-    for i, ch in enumerate(text):
-        piece_len = i - last_cut
-        if piece_len < max_chars // 2:
-            continue
-        if _is_soft_break(ch):
-            piece = text[last_cut:i + 1].strip()
-            if piece:
-                start_ts = _approx_timestamp(last_cut, total, seg.start, seg.end)
-                end_ts = _approx_timestamp(i + 1, total_chars, seg.start, seg.end)
-                result.append(Segment(start_ts, end_ts, piece))
-            last_cut = i + 1
-
-    remaining = text[last_cut:].strip()
-    if remaining:
-        start_ts = _approx_timestamp(last_cut, total_chars, seg.start, seg.end)
-        result.append(Segment(start_ts, seg.end, remaining))
-
-    if not result:
-        result.append(Segment(seg.start, seg.end, text))
-
-    return result
-
-
-def _merge_short_fragments(segments: list[Segment], min_duration: float, min_chars: int) -> list[Segment]:
-    if not segments:
-        return []
-    result = [segments[0]]
-    for seg in segments[1:]:
-        prev = result[-1]
-        prev_dur = prev.end - prev.start
-        seg_dur = seg.end - seg.start
-        if (prev_dur < min_duration or len(prev.text) < min_chars) and seg.start - prev.end < 1.0:
-            merged_text = prev.text.rstrip(",;:，；：、—") + "，" + seg.text
-            result[-1] = Segment(prev.start, seg.end, merged_text)
-        elif seg_dur < min_duration and len(seg.text) < min_chars:
-            merged_text = prev.text.rstrip(",;:，；：、—") + "，" + seg.text
-            result[-1] = Segment(prev.start, seg.end, merged_text)
+    engine = args.engine
+    if engine == "auto":
+        if plat["is_macos"] and plat["is_arm"]:
+            engine = "mlx"
         else:
-            result.append(seg)
-    return result
+            engine = "faster-whisper"
 
+    model_name = args.model
+    if not model_name:
+        if engine == "mlx":
+            model_name = "mlx-community/whisper-large-v3-turbo"
+        else:
+            model_name = "large-v3"
 
-def _fix_time_overlaps(segments: list[Segment]) -> list[Segment]:
-    if not segments:
-        return []
-    result = [segments[0]]
-    for seg in segments[1:]:
-        prev = result[-1]
-        if seg.start < prev.end:
-            seg.start = prev.end
-        if seg.end <= seg.start:
-            seg.end = seg.start + 0.3
-        result.append(seg)
-    return result
+    if engine == "mlx" and not (plat["is_macos"] and plat["is_arm"]):
+        print("warning: mlx engine requires macOS arm64, falling back to faster-whisper",
+              file=sys.stderr)
+        engine = "faster-whisper"
+        model_name = model_name or "large-v3"
 
-
-def _postprocess_segments(
-    segments: list[Segment],
-    max_duration: float = 8.0,
-    max_chars: int = 80,
-    min_duration: float = 1.5,
-    min_chars: int = 5,
-) -> list[Segment]:
-    if not segments:
-        return []
-
-    expanded = []
-    for seg in segments:
-        sub = _split_by_punctuation(seg)
-        for s in sub:
-            expanded.extend(_split_long_segment(s, max_duration, max_chars))
-
-    merged = _merge_short_fragments(expanded, min_duration, min_chars)
-    fixed = _fix_time_overlaps(merged)
-    return fixed
-
-
-def _parse_timestamp_funasr(ts_val) -> float:
-    if isinstance(ts_val, (int, float)):
-        return float(ts_val)
-    if isinstance(ts_val, (list, tuple)) and len(ts_val) >= 2:
-        return float(ts_val[0])
-    return 0.0
-
-
-def _parse_sentence_list(sentences: list, seg_start: float) -> list[Segment]:
-    segments = []
-    for sent in sentences:
-        if isinstance(sent, dict):
-            ts = sent.get("timestamp") or sent.get("ts") or sent.get("time")
-            text = (sent.get("text") or sent.get("value") or sent.get("subtitle") or "").strip()
-            if not text:
-                continue
-            if isinstance(ts, (list, tuple)) and len(ts) >= 2:
-                s = _parse_timestamp_funasr(ts)
-                e = _parse_timestamp_funasr(ts[1]) if isinstance(ts[1], (int, float)) else seg_start + 2.0
-            else:
-                s = seg_start
-                e = s + 2.0
-            segments.append(Segment(s, e, text))
-        elif isinstance(sent, str):
-            sent = sent.strip()
-            if sent:
-                segments.append(Segment(seg_start, seg_start + 2.0, sent))
-                seg_start += 2.0
-    return segments
-
-
-def _try_extract_sentence_info(result, seg_id: int, default_start: float, default_dur: float) -> list[Segment] | None:
-    if isinstance(result, dict):
-        sent_info = result.get("sentence_info")
-        if isinstance(sent_info, list) and sent_info:
-            segments = _parse_sentence_list(sent_info, default_start)
-            if segments:
-                return segments
-    return None
-
-
-def _try_extract_sentence_info_flat(result, default_start: float, default_dur: float) -> list[Segment] | None:
-    if isinstance(result, dict):
-        info = result.get("sentence_info")
-        if isinstance(info, list):
-            return _parse_sentence_list(info, default_start)
-    return None
-
-
-def _try_extract_segments_direct(result) -> list[Segment] | None:
-    if isinstance(result, list) and result:
-        if isinstance(result[0], dict):
-            segments = []
-            for item in result:
-                text = (item.get("text") or item.get("value") or "").strip()
-                if not text:
-                    continue
-                ts = item.get("timestamp") or item.get("ts")
-                if isinstance(ts, (list, tuple)) and len(ts) >= 2:
-                    s = _parse_timestamp_funasr(ts)
-                    e = _parse_timestamp_funasr(ts[1]) if isinstance(ts[1], (int, float)) else s + 2.0
-                    segments.append(Segment(s, e, text))
-            if segments:
-                return segments
-        elif isinstance(result[0], str):
-            segments = []
-            for i, text in enumerate(result):
-                text = text.strip()
-                if text:
-                    segments.append(Segment(i * 2.0, i * 2.0 + 2.0, text))
-            if segments:
-                return segments
-    return None
-
-
-def _try_extract_text_only(result) -> list[Segment] | None:
-    if isinstance(result, str):
-        text = result.strip()
-        if text:
-            return [Segment(0.0, 2.0, text)]
-    if isinstance(result, dict) and "text" in result:
-        text = result["text"].strip()
-        if text:
-            return [Segment(0.0, 2.0, text)]
-    return None
-
-
-def parse_funasr_result(result, audio_duration: float | None = None) -> list[Segment]:
-    default_dur = audio_duration if audio_duration and audio_duration > 0 else 30.0
-    default_start = 0.0
-
-    if result is None:
-        raise ValueError("FunASR returned None")
-
-    handlers = [
-        lambda r: _try_extract_sentence_info(r, 0, 0.0, default_dur),
-        lambda r: _try_extract_sentence_info_flat(r, 0.0, default_dur),
-        lambda r: _try_extract_segments_direct(r),
-        lambda r: _try_extract_text_only(r),
-    ]
-
-    for handler in handlers:
-        segments = handler(result)
-        if segments:
-            return segments
-
-    raise ValueError(f"unable to parse FunASR result: {type(result)}")
-
-
-def transcribe(audio_path: str, model_name: str = "FunAudioLLM/Fun-ASR-Nano-2512",
-               device: str = "cpu") -> list[Segment]:
-    print(f"loading model: {model_name}", file=sys.stderr)
-    print(f"device: {device}", file=sys.stderr)
-
-    try:
-        from funasr import AutoModel
-    except ImportError:
-        print("error: funasr not installed, run: pip install funasr", file=sys.stderr)
-        sys.exit(1)
-
-    model = AutoModel(
-        model=model_name,
-        vad_model="fsmn-vad",
-        punc_model="ct-punc",
-        device=device,
+    seg_func = transcribe_mlx if engine == "mlx" else transcribe_faster
+    segments = seg_func(
+        str(audio_path), model_name, lang,
+        args.max_line_length, pause_threshold, args.max_line_ms,
     )
 
-    print(f"transcribing: {audio_path}", file=sys.stderr)
-    result = model.generate(input=audio_path)
-
-    audio_duration = None
-    try:
-        import soundfile as sf
-        audio_data, sr = sf.read(audio_path)
-        audio_duration = len(audio_data) / sr
-    except Exception:
-        pass
-
-    segments = parse_funasr_result(result, audio_duration)
-    print(f"raw segments: {len(segments)}", file=sys.stderr)
-    return segments
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Transcribe audio/video to SRT using FunASR")
-    parser.add_argument("input", help="input audio or video file")
-    parser.add_argument("--output", "-o", help="output SRT path (default: <input>.srt)")
-    parser.add_argument("--config", "-c", help="path to config.json")
-    parser.add_argument("--model", default="FunAudioLLM/Fun-ASR-Nano-2512",
-                        help="FunASR model name (default: FunAudioLLM/Fun-ASR-Nano-2512)")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "mps", "cuda"],
-                        help="device (default: cpu)")
-    parser.add_argument("--max-line-duration", type=float, default=8.0,
-                        help="max seconds per subtitle line (default: 8.0)")
-    parser.add_argument("--max-line-chars", type=int, default=80,
-                        help="max characters per subtitle line (default: 80)")
-    parser.add_argument("--min-line-duration", type=float, default=1.5,
-                        help="min seconds before merging short fragments (default: 1.5)")
-
-    args = parser.parse_args()
-
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"error: file not found {input_path}", file=sys.stderr)
-        sys.exit(1)
-
-    output_path = args.output or str(input_path.with_suffix(".srt"))
-
-    audio_extensions = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma"}
-    is_audio = input_path.suffix.lower() in audio_extensions
-
-    if is_audio:
-        work_path = str(input_path)
-    else:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_wav = tmp.name
-        extract_audio(str(input_path), tmp_wav)
-        work_path = tmp_wav
-
-    try:
-        segments = transcribe(work_path, model_name=args.model, device=args.device)
-
-        cleaned = _postprocess_segments(
-            segments,
-            max_duration=args.max_line_duration,
-            max_chars=args.max_line_chars,
-            min_duration=args.min_line_duration,
-        )
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            for i, seg in enumerate(cleaned, 1):
-                f.write(f"{i}\n")
-                f.write(f"{format_timestamp(seg.start)} --> {format_timestamp(seg.end)}\n")
-                f.write(f"{seg.text}\n\n")
-
-        print(f"done! {len(cleaned)} segments -> {output_path}", file=sys.stderr)
-    finally:
-        if not is_audio and 'tmp_wav' in locals():
-            os.unlink(tmp_wav)
->>>>>>> b6fa199 (refactor: migrate Whisper to FunASR with enhanced sentence segmentation)
+    write_srt(segments, output_path)
+    print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
+    return output_path
 
 
 if __name__ == "__main__":

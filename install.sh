@@ -18,12 +18,16 @@ else
 fi
 
 mkdir -p "$TARGET/scripts"
+mkdir -p "$TARGET/docs"
 
 # Copy SKILL.md
 cp "$SOURCE/SKILL.md" "$TARGET/SKILL.md"
 
 # Copy scripts
 cp "$SOURCE/scripts/transcribe.py" "$TARGET/scripts/transcribe.py"
+
+# Copy docs
+cp -r "$SOURCE/docs/"* "$TARGET/docs/"
 
 # Copy config.example.json -> config.json if not exists
 if [ ! -f "$TARGET/config.json" ]; then

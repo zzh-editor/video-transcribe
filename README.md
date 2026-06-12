@@ -2,24 +2,35 @@
 
 适用于 AI 编程助手（OpenCode、Claude Code、Cursor 等）的视频/音频转录 skill。
 
-输入视频或音频文件 → 提取音频 → FunASR 转写（Fun-ASR-Nano + VAD + 标点）→ 可选润色 → 可选翻译 → 输出 SRT 字幕。
+输入本地视频或音频文件 → ffmpeg 提取音频 → Whisper 转写（macOS 用 MLX 加速，其他用 faster-whisper）→ 可选调用 Srt-Enhancer 润色 → 可选翻译 → 输出高精度 SRT 字幕文件。
 
-无需烧录、无需下载、不依赖任何 API，全程本地运行。跨平台统一引擎（macOS / Windows / Linux 皆同）。
-
----
+全程本地运行，无需任何 API，不烧录字幕，不输出视频。
 
 ## Features
 
-- **FunASR 转写** — 基于 Fun-ASR-Nano 模型（SenseVoice 编码器 + Qwen3-0.6B 解码器），支持 31 种语言/方言
-- **VAD 语音活动检测** — fsmn-vad 自动按语音段切分，获取句子级时间戳
-- **智能断句** — 文本后处理：标点二次分裂 → 超长段拆分 → 短碎片合并 → 时间重叠修正
-- **标点恢复** — ct-punc 自动添加标点符号
-- **可选润色** — 集成 [Srt-Enhancer](https://github.com/zzh-editor/Srt-Enhancer) 去口癖、ASR 纠错、中西文混排规范化
-- **可选翻译** — 支持纯中文 / 中英双语（中上原下 / 原上中下）
-- **跨平台统一** — macOS / Windows / Linux 同一套代码，无需区分引擎
+- **Whisper 词级时间戳转写** — 基于 large-v3-turbo 模型，macOS arm64 用 mlx-whisper（Apple GPU 加速），其他平台用 faster-whisper
+- **三层智能断句** — 强边界拆分（句末标点/自然停顿/应答词保护）→ 超长块软切（逗号/连词/最大间隙/等分兜底）→ 短碎片合并，辅以后处理（去重/去无效/修正重叠）
+- **应答词保护** — 好/对/OK/yes/no 等 40+ 个单字/单词应答独立成块，不与其他合并
+- **语言自适应** — 中文 300ms / 英文 500ms 停顿阈值自动切换
+- **全平台统一** — macOS Apple Silicon 自动 MLX 加速；Windows / Linux / Intel Mac 自动 fallback 到 faster-whisper CPU/CUDA
+- **可选润色** — 集成 [Srt-Enhancer](https://github.com/zzh-editor/Srt-Enhancer) 去口癖、ASR 纠错、的/得/地修正、中西文混排规范化
+- **可选翻译** — 支持纯中文 / 中上原下 / 原上中下，含游戏美术/3D/绑定方向特化翻译规则
+- **模型自动管理** — 首次运行自动创建 Python venv 并下载 Whisper 模型（约 1.6GB），缓存到技能目录
 
 ## 安装
 
+### 方式一：npx skills（推荐）
+
+```bash
+npx skills add zzh-editor/video-transcribe
+```
+
+> `.skillignore` 已配置，`README.md` 不会被下载到技能目录中。
+
+自动安装到当前 AI 编程助手。
+
+### 方式二：手动克隆
+
 ```bash
 git clone https://github.com/zzh-editor/video-transcribe.git
 cd video-transcribe
@@ -28,33 +39,11 @@ bash install.sh
 
 ### 依赖
 
-- **ffmpeg** — 音频提取
+- **ffmpeg** — 音频提取（macOS: `brew install ffmpeg`，Ubuntu: `sudo apt install ffmpeg`，Windows: `winget install ffmpeg`）
 - **Python 3.8+**
-- **funasr** — `pip install funasr`（自动安装 PyTorch 等）
-- 模型首次运行自动下载（约 3GB）
-
-
-### npx
-
-```bash
-npx github:zzh-editor/video-transcribe
-```
-
-### 手动
-
-```bash
-git clone https://github.com/zzh-editor/video-transcribe.git
-cd video-transcribe
-bash install.sh
-```
-
-### 依赖
-
-```bash
-pip install funasr torch
-```
-
-需系统安装 ffmpeg。macOS Apple Silicon 可用 MPS 加速（`--device mps`）。
+- **mlx-whisper**（macOS arm64）：`python3 -m venv venv && venv/bin/pip install mlx-whisper`
+- **faster-whisper**（其他平台）：`python3 -m venv venv && venv/bin/pip install faster-whisper`
+- **模型**：whisper-large-v3-turbo（约 1.6GB），首次运行自动下载
 
 ## 使用
 
@@ -63,90 +52,79 @@ pip install funasr torch
 ```
 转录视频 /path/to/video.mp4
 转录音频 /path/to/audio.mp3
-transcribe video /path/to/video.mp4
-generate subtitles /path/to/video.mkv
+transcribe video /path/to/video.mkv
+transcribe audio /path/to/audio.wav
+生成字幕 /path/to/video.mov
 ```
 
 ### 工作流
 
-1. **提取音频** — 用 ffmpeg 提取 16kHz 单声道 WAV
-2. **转写** — FunASR AutoModel（Fun-ASR-Nano + VAD + 标点）
-3. **[可选] 润色** — 如已安装 `srt-enhancer`，询问是否调用
-4. **[可选] 翻译** — 非中文询问翻译模式（纯中文 / 中上原下 / 原上中下）
-5. **输出** — 最终 SRT 到 `output_dir/data/`
+1. 提供本地视频或音频文件路径（不接受 URL）
+2. ffmpeg 提取 16kHz 单声道 WAV
+3. Whisper 词级时间戳转写 → 三层智能断句 → 原始 SRT
+4. **[可选]** 如已安装 Srt-Enhancer，询问是否调用润色
+5. **[可选]** 非中文内容询问翻译模式（纯中文 / 中上原下 / 原上中下）
+6. 输出最终 SRT 到输入文件所在目录，命名为 `<输入文件名>_<语言>.srt`
 
-### 指定语种
+### 示例
 
-1. 用户提供本地视频或音频文件路径
-2. 提取音频（ffmpeg → 16kHz WAV）
-3. FunASR 转写 → VAD 句子级时间戳 → 文本后处理断句
-4. [可选] 调用 [Srt-Enhancer](https://github.com/zzh-editor/Srt-Enhancer) 润色（需已安装）
-5. [可选] 翻译（纯中文 / 中上原下 / 原上中下）
-6. 输出最终 SRT 到 `output_dir/data/`
-
-### 指定设备
-
-macOS Apple Silicon 可用 Metal GPU 加速：
-
+**输入视频：**
 ```
-转录视频 /path/to/video.mp4 使用 MPS
+/path/to/tutorial.mp4
+```
+
+**输出 SRT：**
+```srt
+1
+00:00:01,200 --> 00:00:04,500
+今天我们来看一下 Whisper 转写的效果
+
+2
+00:00:04,800 --> 00:00:08,200
+在 macOS 上它会自动使用 MLX 加速
 ```
 
 ## 目录结构
 
 ```
 video-transcribe/
+├── .skillignore                     # 排除 README.md 不被 npx skills add 下载
 ├── SKILL.md                         # 技能定义（核心文件）
 ├── config.example.json              # 配置模板
 ├── install.sh                       # 安装脚本
 ├── scripts/
-│   └── transcribe.py                # 转写脚本（FunASR AutoModel）
+│   └── transcribe.py                # 转写脚本（Whisper 词级时间戳引擎）
+└── docs/
+    └── 游戏留学SRT翻译规则.md        # 游戏/3D/绑定方向翻译补充规则
 ```
 
 ## 配置
-
-编辑 `config.json` 设置：
 
 编辑 `config.json`：
 
 ```json
 {
-  "output_dir": "~/Documents/video-transcribe-output",
-  "model": "FunAudioLLM/Fun-ASR-Nano-2512",
-<<<<<<< HEAD
-  "vad": {
-    "max_single_segment_time": 60000
-  }
-}
-```
-
-- `output_dir` — 转录产物输出目录
-- `model` — FunASR 模型名称（可换 SenseVoiceSmall / Paraformer 等）
-- `vad` — VAD 参数配置
-
----
-
-## 工作原理
-
-核心转写脚本 `scripts/transcribe.py`：
-
-- 使用 `funasr.AutoModel` 统一接口
-- Fun-ASR-Nano 模型（SenseVoice 编码器 + Qwen3-0.6B 解码器）
-- fsmn-vad 按语音停顿自动切分句子
-- ct-punc 恢复标点符号
-- 多级输出解析：`sentence_info` → `timestamp+text` → `text only`
-- 31 种语言/方言自动检测
-
-  "vad": true
+  "model": {
+    "engine": "mlx",
+    "name": "mlx-community/whisper-large-v3-turbo",
+    "max_line_length": 40,
+    "max_line_ms": 6000,
+    "pause_ms_zh": 300,
+    "pause_ms_en": 500
+  },
+  "tmp_dir": ".opencode/skills/video-transcribe/tmp"
 }
 ```
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| output_dir | `~/Documents/video-transcribe-output` | 转录产物输出目录 |
-| model | `FunAudioLLM/Fun-ASR-Nano-2512` | FunASR 模型名称 |
-| vad | `true` | 是否启用 VAD 切分 |
-
+| `model.engine` | `mlx` | 引擎（mlx / faster-whisper） |
+| `model.name` | `mlx-community/whisper-large-v3-turbo` | Whisper 模型名称 |
+| `model.max_line_length` | `40` | 每行最大字符数 |
+| `model.max_line_ms` | `6000` | 每段最大时长（毫秒） |
+| `model.pause_ms_zh` | `300` | 中文停顿阈值（毫秒） |
+| `model.pause_ms_en` | `500` | 英文停顿阈值（毫秒） |
+| `tmp_dir` | `.opencode/skills/video-transcribe/tmp` | 临时文件目录 |
 
 ## License
 

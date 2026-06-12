@@ -1,37 +1,11 @@
 {
-  "output_dir": "~/Documents/video-transcribe-output",
-  "model": "FunAudioLLM/Fun-ASR-Nano-2512",
-<<<<<<< HEAD
-  "vad": {
-    "max_single_segment_time": 60000
+  "model": {
+    "engine": "mlx",
+    "name": "mlx-community/whisper-large-v3-turbo",
+    "max_line_length": 40,
+    "max_line_ms": 6000,
+    "pause_ms_zh": 300,
+    "pause_ms_en": 500
   },
-=======
-  "vad": true,
->>>>>>> b6fa199 (refactor: migrate Whisper to FunASR with enhanced sentence segmentation)
-  "__ui": {
-    "fields": {
-      "output_dir": {
-        "label": "输出目录",
-        "type": "directory",
-        "required": true,
-        "description": "转录产物的输出目录。转录出的 SRT 文件写入此目录。",
-        "placeholder": "请选择输出目录…"
-      },
-      "model": {
-        "label": "模型",
-        "type": "string",
-        "required": false,
-        "description": "FunASR 模型名称，默认 FunAudioLLM/Fun-ASR-Nano-2512",
-        "placeholder": "FunAudioLLM/Fun-ASR-Nano-2512"
-      },
-      "vad": {
-        "label": "VAD 切分",
-        "type": "boolean",
-        "required": false,
-        "description": "是否启用语音活动检测（VAD）按句子切分",
-        "default": true
-      }
-    },
-    "order": ["output_dir", "model", "vad"]
-  }
+  "tmp_dir": ".opencode/skills/video-transcribe/tmp"
 }
