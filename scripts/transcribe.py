@@ -7,7 +7,6 @@ Pipeline:
     VAD pre-split (Silero VAD for mlx, vad_filter for faster-whisper)
     → Whisper transcription per chunk
     → Optional MMS_FA CTC forced alignment (corrects segment boundaries)
-    → process_raw_segments (merge short + split long)
     → refine_segments (semantic refinement)
 
 Usage:
@@ -26,6 +25,7 @@ from pathlib import Path
 
 SENTENCE_END = frozenset(".?!。？！…")
 SOFT_BREAK = frozenset(",;:，；：、—")
+INITIAL_PROMPT_ZH = "以下是普通话的句子，使用简体中文书写。"
 CONJUNCTIONS = [
     "然后", "所以", "但是", "不过", "而且", "另外", "还有", "接下来",
     "but", "and", "so", "however", "then", "because", "also",
@@ -278,75 +278,6 @@ def _split_long_segment(seg: dict, max_chars: int, max_line_ms: int) -> list[dic
     }]
 
 
-def process_raw_segments(segments: list, *,
-                         max_line_ms: int = 6000,
-                         max_chars: int = 25,
-                         pause_threshold: float = 0.3) -> list[dict]:
-    """
-    Process Whisper raw segments as baseline — only merge short fragments
-    and split over-long segments. Preserves Whisper's natural segmentation.
-    """
-    raw = _normalize_segments(segments)
-    if not raw:
-        return []
-
-    # Phase 1: Merge short adjacent segments
-    merged = [raw[0]]
-    for seg in raw[1:]:
-        text = seg["text"]
-        dur = seg["end"] - seg["start"]
-        gap = seg["start"] - merged[-1]["end"]
-
-        if is_protected(text):
-            merged.append(seg)
-            continue
-
-        if dur < 0.6 and gap < pause_threshold and text:
-            prev = merged[-1]
-            sep = "" if text and text[0] in "，、。？！" else ""
-            prev["text"] = prev["text"].rstrip("，、；：") + sep + text
-            prev["end"] = seg["end"]
-            prev["words"].extend(seg["words"])
-        else:
-            merged.append(seg)
-
-    # Phase 2: Split over-length segments
-    split = []
-    for seg in merged:
-        text = seg["text"]
-        char_len = len(text.replace(" ", ""))
-        dur = seg["end"] - seg["start"]
-
-        if char_len <= max_chars and dur <= max_line_ms / 1000:
-            split.append(seg)
-        else:
-            sub = _split_long_segment(seg, max_chars, max_line_ms)
-            split.extend(sub)
-
-    # Phase 3: Deduplicate + fix time overlaps
-    cleaned = []
-    for seg in split:
-        if seg["end"] <= seg["start"]:
-            continue
-        text = seg["text"]
-        if cleaned and text == cleaned[-1]["text"]:
-            cleaned[-1]["end"] = max(cleaned[-1]["end"], seg["end"])
-            continue
-        cleaned.append(seg)
-
-    for k in range(1, len(cleaned)):
-        prev_end = cleaned[k - 1]["end"]
-        if cleaned[k]["start"] < prev_end:
-            gap = cleaned[k]["end"] - prev_end
-            if gap > 0.01:
-                cleaned[k]["start"] = prev_end
-            else:
-                cleaned[k] = dict(cleaned[k], start=prev_end + 0.01,
-                                  end=prev_end + 0.3)
-
-    return cleaned
-
-
 # ── Model cache migration ──────────────────────────────────────────
 
 def _migrate_model_cache(models_dir: str):
@@ -434,6 +365,7 @@ def _transcribe_vad_chunks(audio_path: str, model_name: str, language: str | Non
                 path_or_hf_repo=model_name,
                 language=language,
                 word_timestamps=True,
+                initial_prompt=INITIAL_PROMPT_ZH if language and language.startswith("zh") else None,
             )
             for seg in result.get("segments", []):
                 seg["start"] += vs['start']
@@ -450,6 +382,7 @@ def _transcribe_vad_chunks(audio_path: str, model_name: str, language: str | Non
         result = mlx_whisper.transcribe(
             audio_np, path_or_hf_repo=model_name,
             language=language, word_timestamps=True,
+            initial_prompt=INITIAL_PROMPT_ZH if language and language.startswith("zh") else None,
         )
         all_segments = result.get("segments", [])
 
@@ -484,6 +417,7 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
             path_or_hf_repo=model_name,
             language=language,
             word_timestamps=True,
+            initial_prompt=INITIAL_PROMPT_ZH if language and language.startswith("zh") else None,
         )
         raw_segments = result.get("segments", [])
 
@@ -495,22 +429,17 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
         sys.exit(1)
 
     raw_count = len(raw_segments)
-    out = process_raw_segments(
-        raw_segments,
-        max_line_ms=max_line_ms,
-        max_chars=max_line_length,
-        pause_threshold=pause_threshold,
-    )
 
     try:
         from refine_segments import refine as refine_segs
-        before = len(out)
-        out = refine_segs(out, max_chars=max_line_length)
+        before = len(raw_segments)
+        out = refine_segs(raw_segments, max_chars=max_line_length)
         if len(out) != before:
             print(f"refine_segments: {before} → {len(out)} segments (semantic merge/split)",
                   file=sys.stderr)
     except ImportError:
         print("refine_segments not available, skipping", file=sys.stderr)
+        out = raw_segments
 
     print(f"segments: {raw_count} raw segs → {len(out)} segments",
           file=sys.stderr)
@@ -538,6 +467,7 @@ def transcribe_faster(audio_path: str, model_name: str, language: str | None,
         audio_path, language=language,
         word_timestamps=True,
         vad_filter=vad,
+        initial_prompt=INITIAL_PROMPT_ZH if language and language.startswith("zh") else None,
     )
     elapsed = time.time() - t0
     print(f"transcription took {elapsed:.1f}s", file=sys.stderr)
@@ -546,22 +476,16 @@ def transcribe_faster(audio_path: str, model_name: str, language: str | None,
     raw_segments = list(seg_iter)
     raw_count = len(raw_segments)
 
-    out = process_raw_segments(
-        raw_segments,
-        max_line_ms=max_line_ms,
-        max_chars=max_line_length,
-        pause_threshold=pause_threshold,
-    )
-
     try:
         from refine_segments import refine as refine_segs
-        before = len(out)
-        out = refine_segs(out, max_chars=max_line_length)
+        before = len(raw_segments)
+        out = refine_segs(raw_segments, max_chars=max_line_length)
         if len(out) != before:
             print(f"refine_segments: {before} → {len(out)} segments (semantic merge/split)",
                   file=sys.stderr)
     except ImportError:
         print("refine_segments not available, skipping", file=sys.stderr)
+        out = raw_segments
 
     print(f"segments: {raw_count} raw segs → {len(out)} segments",
           file=sys.stderr)

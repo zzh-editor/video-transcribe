@@ -1,22 +1,47 @@
-# video-transcribe
+# Video Transcribe
 
-视频音频转录为高精度 SRT 字幕文件。macOS Apple Silicon 通过 MLX 加速，其他平台自动切换 faster-whisper。
+视频音频转录为字幕 Agent Skill — Whisper 转写 + 语义断句 + 可选润色 + 可选翻译，输出高精度 SRT 字幕文件。
+
+## 触发词
+
+在支持 Agent Skills 的 CLI（OpenCode、Claude Code、Cursor 等）中，说以下任意一句 + 视频/音频文件路径即可自动调用：
+
+```
+转录 / 转录音频 / 转录视频 / 转录字幕
+把文件转成字幕 / 把音频转录成字幕 / 把视频转录成字幕
+transcribe / transcribe audio / transcribe video
+generate subtitles / generate srt / convert to srt
+```
+
+输入后 Agent 会自动：提取音频 → Whisper 转写 → 语义断句 → [可选] 润色 → [可选] 翻译 → 输出 SRT。
 
 ## 安装
 
+### OpenCode / Claude Code / Cursor 等
+
 ```bash
-# 使用 npx 安装（推荐）
+# 安装（自动注册到 skills 列表）
 npx skills@latest install https://github.com/zzh-editor/video-transcribe
 
-# 或直接克隆
+# 更新
+npx skills@latest update https://github.com/zzh-editor/video-transcribe
+
+# 查看已安装的 skills
+npx skills@latest list
+```
+
+### 直接克隆（开发者）
+
+```bash
 git clone https://github.com/zzh-editor/video-transcribe.git
 cd video-transcribe
 bash scripts/setup.sh
+git pull origin main  # 更新
 ```
 
-需要 Python 3.8+ 及 ffmpeg。
+> 需要 Python 3.8+ 和 ffmpeg。
 
-## Pipeline
+## 工作流程
 
 ```
 本地视频/音频文件
@@ -25,105 +50,116 @@ bash scripts/setup.sh
 ① 提取音频 (ffmpeg → 16kHz WAV)
       │
       ▼
-② Whisper 转写 → raw segments 为基线的增量分段
+② VAD 切割
+      │   macOS arm64 → Silero VAD 分片
+      │   其他平台   → faster-whisper 内置 vad_filter
+      ▼
+③ Whisper 逐片转录
       │   macOS arm64 → mlx-whisper (Apple GPU)
       │   其他平台   → faster-whisper (CPU/CUDA)
-      │   合并过短段 + 拆分长句 + 应答词保护
       ▼
-③ refine_segments.py 级联语义断句
-      │   句末标点 / 转折连词 / 话题标记 / 话语标记 / 时间状语 / OK 隔离
-      │   递归切割 + 智能短句合并
+④ refine_segments.py 级联语义断句
+      │   句末标点 / 转折连词 / 话题标记 / 话语标记分段
       ▼
-④ raw.srt ← 原始 SRT（时间轴无损）
+⑤ raw.srt ← 原始 SRT
       │
       ▼
-⑤ 可选 srt-enhancer 润色（去口癖/ASR纠错/混排规范）
-      │   传入 --skip refine（本流程已做语义断句）
-      ▼
-⑥ 可选翻译（纯中文 / 中上原下 / 原上中下）
+⑥ 🔴 CHECKPOINT: 润色确认
+      │
+      ├── 是 → ⑦ srt-enhancer 润色
+      └── 否 → ⑧ 以 raw.srt 为基线
       │
       ▼
-⑦ 输出：最终 SRT
+⑨ [可选] 翻译（纯中文 / 中上原下 / 原上中下）
+      │
+      ▼
+⑩ 输出：最终 SRT（与输入文件同目录）
 ```
 
-## 特性
+## 处理能力
 
-- **双后端自动切换**：macOS arm64 自动用 mlx-whisper（Apple GPU），其他平台用 faster-whisper
-- **以 Whisper raw segments 为基线**：保留模型原生分段质量，仅做必要微调（合并过短段 + 拆分超长段），40+ 应答词保护
-- **级联语义断句**：refine_segments.py 以 7 级优先级（句末标点/转折连词/话题标记/话语标记/时间状语/时间词/OK隔离）递归切割，按字符比例分配时间
-- **可选润色**：集成 [Srt-Enhancer](https://github.com/zzh-editor/Srt-Enhancer) 去口癖、ASR 纠错、混排空格规范，自动跳过重复的语义断句
-- **可选翻译**：非中文内容支持纯中文 / 中上原下 / 原上中下三种翻译模式
-- **Whisper large-v2 模型**，首次运行自动下载（约 1.6GB）至技能目录
+| 功能 | 说明 |
+|------|------|
+| 平台自适应 | macOS arm64 → mlx-whisper (Apple GPU)；其他 → faster-whisper (CPU/CUDA) |
+| VAD 智能分片 | Silero VAD 精准切割静音段，长音频分片转录提高准确率 |
+| 语义断句 | 8 级级联切割：句末标点/转折连词/话题标记/话语标记/时间状语/OK隔离/响应标记/重复检测 |
+| 应答词保护 | 40+ 个应答词（好/对/嗯/是/不/行等）独立成块，不与其他合并 |
+| 繁简转换 | 自动将繁体中文转录结果转为简体（initial_prompt 引导） |
+| [可选] 润色 | 调用 srt-enhancer：去口癖、ASR 纠错、的得地修正、混排空格、标点清理 |
+| [可选] 翻译 | AI 逐段翻译，支持纯中文/中上原下/原上中下三种模式 |
+| 简体中文输出 | 每行 ≤18 字符，按语义断点拆分，去标点 |
 
-## 断句策略
-
-```
-Phase 1 — 合并过短相邻段
-  ├── 段时长 < 0.6s 且与前段间隙 < 300ms
-  ├── → 合并到前段（保护词如 好/对/OK 独立保留）
-  └── 避免 Whisper 因微小停顿产生的碎片化分段
-
-Phase 2 — 拆分超长段
-  ├── 字符数 > 25 或时长 > 6s 触发拆分
-  ├── a. 优先在逗号/连词处拆
-  ├── b. 次选最大词间隙处拆
-  └── c. 字符边界兜底
-
-Phase 3 — 清理
-  ├── 丢弃无效时间戳 / 去重连续文本 / 修正时间重叠
-```
-
-**后处理 — refine_segments.py 级联语义切割**：以 7 级优先级从高到低检测切割点，递归分割至阈值，最后合并短碎片。
-
-## 使用
+## 直接调用脚本
 
 ```bash
-# 安装依赖
-bash scripts/setup.sh
-
-# 提取音频
-ffmpeg -i input.mp4 -vn -ar 16000 -ac 1 audio.wav
-
-# 转写（中文，每行最长 25 字符，最长 6 秒）
+# 基础转录
 venv/bin/python3 scripts/transcribe.py audio.wav \
-  --output output.srt --language zh \
-  --max-line-length 25 --max-line-ms 6000
+  --output raw.srt \
+  --language zh \
+  --max-line-length 25 \
+  --max-line-ms 6000
 
-# 独立运行语义优化（可选，transcribe.py 内部已调用）
+# 强制启用 VAD（≥30 分钟长音频推荐）
+venv/bin/python3 scripts/transcribe.py audio.wav \
+  --output raw.srt \
+  --language zh \
+  --vad
+
+# 强制关闭 VAD
+venv/bin/python3 scripts/transcribe.py audio.wav \
+  --output raw.srt \
+  --language zh \
+  --no-vad
+
+# 独立运行语义断句验证
 venv/bin/python3 scripts/refine_segments.py raw.srt
 ```
 
-参数说明：
+## 脚本
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--max-line-length` | 25 | 每行最多字符数 |
-| `--max-line-ms` | 6000 | 每段最长时长（ms） |
-| `--language` | 自动检测 | 语言代码（zh/en/ja 等） |
-| `--pause-ms` | 300zh/500en | 停顿断句阈值 |
-| `--engine` | auto | 强制指定引擎（mlx/faster-whisper） |
-
-## 依赖
-
-- **ffmpeg** — 音频提取
-- **Python 3.8+**
-- **mlx-whisper**（macOS arm64）或 **faster-whisper**（其他平台）
-- Whisper large-v2 模型（首次运行自动下载）
+| 脚本 | 用途 |
+|------|------|
+| `scripts/transcribe.py` | Whisper 转录核心，平台自适应引擎（mlx-whisper / faster-whisper） |
+| `scripts/refine_segments.py` | 8 级级联语义断句引擎 |
+| `scripts/setup.sh` | 依赖自动安装（创建 venv、安装依赖、配置模型路径） |
 
 ## 文件结构
 
 ```
 video-transcribe/
-├── scripts/
-│   ├── transcribe.py         # 转写主脚本（mlx/faster-whisper + 增量分段）
-│   ├── refine_segments.py    # 级联语义断句优化
-│   └── setup.sh              # 环境自动安装脚本
-├── docs/
-│   └── 游戏留学SRT翻译规则.md # 行业翻译补充指南
-├── config.json               # 模型配置
-├── SKILL.md                  # Agent skill 定义
+├── scripts/            # 可执行脚本
+│   ├── transcribe.py   # Whisper 转录核心
+│   ├── refine_segments.py  # 语义断句引擎
+│   └── setup.sh        # 依赖安装
+├── venv/               # Python 虚拟环境（自动创建）
+├── models/             # Whisper 模型缓存（自动下载，约 1.6GB）
+├── docs/               # 行业翻译规则
+├── SKILL.md            # Agent skill 定义（含完整工作流）
 └── README.md
 ```
+
+## 依赖
+
+### 必需
+- **ffmpeg** — 音频提取（`brew install ffmpeg` / `sudo apt install ffmpeg`）
+- **Python 3.8+**
+- **mlx-whisper**（macOS arm64）— Apple GPU 加速
+- **faster-whisper**（其他平台）— CPU/CUDA 转录
+- **silero-vad-notorch** — VAD 分片（无 torch 依赖）
+- **onnxruntime** — VAD 推理引擎
+
+### 可选
+- **srt-enhancer** — 独立润色技能，提供去口癖、ASR 纠错、混排规范化
+
+## 失败处理
+
+| 场景 | 处理方式 |
+|------|---------|
+| ffmpeg 未安装 | 提示安装命令，停止执行 |
+| Whisper 模型下载失败 | 检查网络，重试或手动下载至 `models/` |
+| VAD 分片失败 | 降级为整段 Whisper 转录 |
+| srt-enhancer 不存在 | 询问用户是否安装，拒绝则跳过润色 |
+| 转写内存不足 | 关闭其他应用，确保 8GB+ RAM |
 
 ## License
 

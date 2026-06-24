@@ -24,25 +24,22 @@ allowed-tools: [Read, Write, Edit, Bash, Glob, Grep]
       │   其他平台   → faster-whisper (CPU/CUDA)
       │   每 VAD 片独立转录，时间戳绝对化后拼接
       ▼
-④ process_raw_segments（合并过短 + 拆分超长）
-      │   保留 Whisper 原始分段质量
-      ▼
-⑤ refine_segments.py 级联语义断句
+④ refine_segments.py 级联语义断句
       │   句末标点 / 转折连词 / 话题标记 / 话语标记分段 + 智能合并
       ▼
-⑥ raw.srt ← 原始 SRT
+⑤ raw.srt ← 原始 SRT
       │
       ▼
-⑦ 🔴 CHECKPOINT: 润色确认
+⑥ 🔴 CHECKPOINT: 润色确认
       │
-      ├── 是 → ⑧ srt-enhancer 润色
-      └── 否 → ⑨ 以 raw.srt 为基线
-      │
-      ▼
-⑩ [可选] 翻译（纯中文 / 中上原下 / 原上中下）
+      ├── 是 → ⑦ srt-enhancer 润色
+      └── 否 → ⑧ 以 raw.srt 为基线
       │
       ▼
-⑪ 输出：最终 SRT（与输入文件同目录）
+⑨ [可选] 翻译（纯中文 / 中上原下 / 原上中下）
+      │
+      ▼
+⑩ 输出：最终 SRT（与输入文件同目录）
 ```
 
 ## 使用方式
@@ -66,28 +63,9 @@ allowed-tools: [Read, Write, Edit, Bash, Glob, Grep]
 
 ## 断句算法
 
-以 Whisper raw segments 为基线做增量调整，保留模型原始分段质量：
+以 Whisper raw segments 为基线，通过 refine_segments.py 做语义断句优化：
 
-```
-Phase 1 — 合并过短相邻段
-  ├── 段时长 < 0.6s 且与前段间隙 < pause_threshold（中文 300ms）
-  ├── → 合并到前段（保护词如 好/对/OK 等独立保留）
-  └── 避免 Whisper 因微小停顿产生的碎片化分段
-
-Phase 2 — 拆分超长段
-  ├── 字符数 > max_chars（默认 25）或时长 > max_line_ms（默认 6000ms）
-  ├── a. 优先在逗号/连词处拆
-  ├── b. 次选最大词间隙处拆
-  ├── c. 字符边界兜底（最后一句在限长内的词）
-  └── 无词级时间戳时按字符比例拆分
-
-Phase 3 — 清理
-  ├── 丢弃无效时间戳
-  ├── 去重连续相同文本（Whisper 重复伪影）
-  └── 修正相邻块时间重叠
-```
-
-后处理 —— refine_segments.py（级联语义切割）
+refine_segments.py（级联语义切割）
   ├── 句末标点分段（。？！… 等句末标点处强制切割）
   ├── 转折连词分段（但是/所以/不过/然而/可是 等连词处切分）
   ├── 话题标记分段（那/那么 智能区分话题标记与限定词）
