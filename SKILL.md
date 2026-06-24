@@ -118,6 +118,10 @@ Phase 3 — 清理
 | srt-enhancer 安装失败 | 检查网络和 npx 是否可用 | 跳过润色，以 raw.srt 为基线 |
 | srt-enhancer 调用失败 | 检查 enhance.py 日志输出 | 跳过润色，以 raw.srt 为基线 |
 | srt-enhancer 输出异常（空文件/乱码） | 检查 enhance.py 日志输出 | 跳过润色，以 raw.srt 为基线 |
+| domain_scanner.py 执行失败 | 回退到 AI 关键词扫描，使用 `general` 领域 | 跳过领域检测，以 `general` 继续 |
+| 联网校准搜索失败（超时/无结果） | 跳过联网校准，使用本地 correction-table.md | 未匹配术语标注 ❗ 低置信度（50-69%）提交用户确认 |
+| 联网校准搜索结果无权威来源 | 跳过该术语修正，标注 ❗ | 保留原文，标记 `#unverified` |
+| srt-enhancer 子步骤被跳过（未执行 domain detection 或 web calibration） | 回退到 Step 4 重新执行完整子步骤清单 | 跳过润色，以 raw.srt 为基线 |
 
 **变量约定**：以下命令中 `<input>` 为用户提供的输入文件路径，`<output_dir>` 为输入文件所在目录（`dirname <input>`）。所有脚本路径相对于技能目录 `~/.config/opencode/skills/video-transcribe/`。
 
@@ -211,11 +215,48 @@ srt-enhancer **已存在** → **用 Question 工具弹窗询问用户：**
 
 srt-enhancer 位于 `~/.config/opencode/skills/srt-enhancer/`，提供去口癖、ASR 纠错、的/得/地修正、标点清理、中英文混排空格规范化。
 
-调用方式：
-1. 用 Skill 工具加载 srt-enhancer 技能，将 `tmp/raw.srt` 作为输入
-2. 指示 srt-enhancer 执行 enhance.py 时**添加 `--skip refine`**（跳过其内置的 refine 断句步骤，因为本流程 Step 3 已做语义断句，避免二次切割破坏时间轴），并**跳过其 Workflow 的 Step 7「Generate Output File」**，执行到 diff 审核确认后即止
-3. 用户确认 diff 后，将增强结果写入 `tmp/enhanced.srt`（diff 表仅对话窗口展示，不写文件）
-4. 关闭 srt-enhancer 子技能，返回本流程
+### 必须执行的子步骤
+
+用 Skill 工具加载 srt-enhancer 技能后，**必须按顺序执行以下子步骤**，不可跳过：
+
+| 子步骤 | srt-enhancer 对应 | 本流程约束 | 说明 |
+|--------|-------------------|-----------|------|
+| ① 领域检测 | Step 2.5 `domain_scanner.py` | 无 | 自动检测字幕领域（Maya/Python/Gaming/AI-3D 等），为联网搜索提供 `search_context` |
+| ② AI 构建 config + 联网校准术语 | Step 3 | 无 | **必须执行联网搜索**：对 correction-table.md 未匹配的术语，用 `"{term}" + "{search_context}"` 联网校准权威写法 |
+| ③ enhance.py 流水线 | Step 4 | 添加 `--skip refine`（跳过 refine 断句，因 Step 3 已做语义断句） | 保留 normalize → terminology → spacing → finalize |
+| ④ AI 复核 + 置信度评分 | Step 5-6 | 无 | 书名号标记 + 置信度评分 + diff 审核表 |
+| ⑤ 用户确认 diff | Step 6 | 无 | 用户确认后将增强结果写入 `tmp/enhanced.srt`，diff 表仅对话窗口展示 |
+
+### 不执行的步骤
+
+- **跳过 Step 7「Generate Output File」**：输出由本流程 Step 5-7 接管
+- **enhance.py 添加 `--skip refine`**：避免与 Step 3 的语义断句重复切割破坏时间轴
+
+### 调用模板
+
+```
+加载 srt-enhancer 技能，将 tmp/raw.srt 作为输入。必须执行：
+1. 运行 domain_scanner.py 检测领域
+2. AI 构建 config 并对未匹配术语执行联网校准
+3. 运行 enhance.py --skip refine
+4. AI 复核 + 置信度评分 + diff 审核
+5. 用户确认后，将增强结果写入 tmp/enhanced.srt
+
+跳过 Step 7（Generate Output File），返回本流程。
+```
+
+## 🔴 CHECKPOINT 🛑 STOP: 润色完成验证
+
+srt-enhancer 执行完毕后，**必须逐项确认以下内容**，任一项未通过则回退到 raw.srt：
+
+| 验证项 | 如何确认 | 未通过处理 |
+|--------|---------|-----------|
+| 领域检测已执行 | srt-enhancer 报告了检测到的领域（如 `general`/`maya`/`python`） | 重新执行 domain_scanner.py |
+| 联网校准已执行 | diff 审核表中有「联网校准」类型的修改项，或术语表已全部匹配无需联网 | 检查 config 中 domain 是否正确，确保 search_context 非空 |
+| diff 审核表已展示 | 用户已确认或逐条审核 diff 表 | 跳过润色，以 raw.srt 为基线 |
+| tmp/enhanced.srt 存在 | `ls tmp/enhanced.srt` 成功 | 跳过润色，以 raw.srt 为基线 |
+
+确认全部通过后进入 Step 5。
 
 ## Step 5: 准备基线字幕
 
@@ -307,6 +348,8 @@ cp "<output_dir>/tmp/final.srt" "<输入文件目录>/<输入文件名>_<语言>
 | 5 | 修改原始时间戳或合并 SRT 条目 | 翻译时严格对齐原文时间戳 | 中英文时间轴错位，字幕与语音不同步 |
 | 6 | 跳过 🔴 CHECKPOINT 检查点 | 检查点是防止自主失控的安全门 | 润色/翻译质量无法审核，错误被掩盖 |
 | 7 | 未经用户确认安装 srt-enhancer | 安装应由用户决定 | 意外修改用户环境，可能与已有版本冲突 |
+| 8 | 跳过 srt-enhancer 子步骤（省略 domain detection 或 web calibration） | 联网校准是术语准确性的关键保障 | 术语靠 AI 猜测，错别字/ASR 误识别无法修正，字幕质量下降 |
+| 9 | Step 4 完成后不验证 srt-enhancer 输出 | 润色结果可能不完整 | 低质量字幕被当作最终结果，用户无法察觉缺失的修正 |
 
 ## 依赖
 
