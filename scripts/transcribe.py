@@ -433,7 +433,7 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
     try:
         from refine_segments import refine as refine_segs
         before = len(raw_segments)
-        out = refine_segs(raw_segments, max_chars=max_line_length)
+        out = refine_segs(raw_segments)
         if len(out) != before:
             print(f"refine_segments: {before} → {len(out)} segments (semantic merge/split)",
                   file=sys.stderr)
@@ -479,7 +479,7 @@ def transcribe_faster(audio_path: str, model_name: str, language: str | None,
     try:
         from refine_segments import refine as refine_segs
         before = len(raw_segments)
-        out = refine_segs(raw_segments, max_chars=max_line_length)
+        out = refine_segs(raw_segments)
         if len(out) != before:
             print(f"refine_segments: {before} → {len(out)} segments (semantic merge/split)",
                   file=sys.stderr)
