@@ -1,0 +1,5 @@
+[
+  {"id": 1, "prompt": "帮我把这个视频转成字幕 /Users/rubber/Downloads/lecture.mp4", "expected": "执行 Step 0-3，提取音频→VAD→转写→输出 raw.srt"},
+  {"id": 2, "prompt": "我有一段50分钟的中文录音，转成SRT字幕文件", "expected": "识别为长音频，自动启用 VAD 分片，转写后输出 SRT"},
+  {"id": 3, "prompt": "把这个英文播客转成中文字幕，要中上原下格式", "expected": "转写→润色确认→翻译确认→选择中上原下模式→翻译输出"}
+]

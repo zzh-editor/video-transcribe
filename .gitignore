@@ -1,0 +1,8 @@
+venv/
+models/hub/
+models/xet/
+tmp/
+.DS_Store
+__pycache__/
+*.pyc
+.agent_harnesses.json

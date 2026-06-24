@@ -1,0 +1,23 @@
+{
+  "model": {
+    "engine": "mlx",
+    "name": "mlx-community/whisper-large-v2-mlx",
+    "max_line_length": 25,
+    "max_line_ms": 6000,
+    "pause_ms_zh": 300,
+    "pause_ms_en": 500
+  },
+  "vad": {
+    "enabled_by_default": true,
+    "min_audio_sec": 600,
+    "merge_gap_s": 1.0,
+    "min_segment_s": 0.5,
+    "silero_threshold": 0.5
+  },
+  "alignment": {
+    "enabled_by_default": true,
+    "padding_sec": 1.0,
+    "device": "cpu"
+  },
+  "tmp_dir": ".opencode/skills/video-transcribe/tmp"
+}
