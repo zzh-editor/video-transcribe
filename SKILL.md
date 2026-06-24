@@ -24,22 +24,25 @@ allowed-tools: [Read, Write, Edit, Bash, Glob, Grep]
       │   其他平台   → faster-whisper (CPU/CUDA)
       │   每 VAD 片独立转录，时间戳绝对化后拼接
       ▼
-④ refine_segments.py 级联语义断句
-      │   句末标点 / 转折连词 / 话题标记 / 话语标记分段 + 智能合并
+④ refine_segments.py 预清洗 + 级联语义断句
+      │   _clean_segments 去空/零时长/重复 → 教学口语标记 / 转折连词 / 话题标记 / 话语标记 / 时间标记分段 + 动态最小字数控制 + 递归切割
       ▼
-⑤ raw.srt ← 原始 SRT
+⑤ cleanup_segments.py 后清洗
+      │   合并相邻重复（refine 的重复检测切分后收口）
+      ▼
+⑥ raw.srt ← 原始 SRT
       │
       ▼
-⑥ 🔴 CHECKPOINT: 润色确认
+⑦ 🔴 CHECKPOINT: 润色确认
       │
-      ├── 是 → ⑦ srt-enhancer 润色
-      └── 否 → ⑧ 以 raw.srt 为基线
-      │
-      ▼
-⑨ [可选] 翻译（纯中文 / 中上原下 / 原上中下）
+      ├── 是 → ⑧ srt-enhancer 润色
+      └── 否 → ⑨ 以 raw.srt 为基线
       │
       ▼
-⑩ 输出：最终 SRT（与输入文件同目录）
+⑩ [可选] 翻译（纯中文 / 中上原下 / 原上中下）
+      │
+      ▼
+⑪ 输出：最终 SRT（与输入文件同目录）
 ```
 
 ## 使用方式
@@ -63,21 +66,68 @@ allowed-tools: [Read, Write, Edit, Bash, Glob, Grep]
 
 ## 断句算法
 
-以 Whisper raw segments 为基线，通过 refine_segments.py 做语义断句优化：
+以 Whisper raw segments 为基线，通过 refine_segments.py 做预清洗 + 语义断句优化：
 
-refine_segments.py（级联语义切割）
-  ├── 句末标点分段（。？！… 等句末标点处强制切割）
-  ├── 转折连词分段（但是/所以/不过/然而/可是 等连词处切分）
-  ├── 话题标记分段（那/那么 智能区分话题标记与限定词）
-  ├── 话语标记分段（首先/其次/然后/另外/还有 处切分）
-  ├── 时间状语分段（等你/等到/有时候）
-  ├── 时间词分段（今天/现在/目前）
-  ├── OK/语气词隔离（从相邻文本分离独立成块）
-  ├── 智能短句合并（≤3 字符非保护词合并到前块）
-  └── 递归切割（对子块递归应用上述规则至阈值）
+### 0. 预清洗 `_clean_segments`
+进入断句前先过滤 ASR 噪声：
+- 空文本段（`text.strip() == ""`）
+- 零时长段（`start == end`）
+- (文本, 起始时间) 完全重复段
 
-应答词保护列表（独立成块，不与其他合并）：
-好/对/嗯/是/不/行/哦/啊/OK/yes/no/yeah/sure/right 等 40+ 个
+### 1. 语义切割（6 级置信度，级联匹配）
+
+| 级别 | 类型 | 触发词 | 切分位置 |
+|------|------|--------|---------|
+| **STRONG** | 强连词 | 但是/但/所以/不过/然而/可是/因此/因而/而且/并且/那如果/那这样/那就/**然后** | 词首 |
+| **STRONG** | 话题标记 | 那（智能区分话题标记 vs 限定词） | 词首 |
+| **STRONG** | 话语标记 | 首先/其次/然后/接着/另外/还有/此外/同样/比如说/说白了/也就是说/所以说/**我们来/**我们再来/**来看一下** 等 | 词尾后 |
+| **STRONG** | 时间标记 | 到时候/有时候/接下来/那接下来/那现在/现在我们来/我们一起来/**之后/完成之后/做好之后** | 词首 |
+| **STRONG** | 回应+话题模式 | 好那/好现在/好那我们/好我们/好接下来/对那/行那 | 正则匹配偏移 |
+| **MEDIUM** | OK/语气词隔离 | OK/ok/Okay | 词尾 |
+| **MEDIUM** | 回应标签前切分 | 是吧/对吧/好吧/没问题/没错/是的/就这样 等 | 词首 |
+| **MEDIUM** | 重复检测 | 前 2 CJK 字符在文本中再次出现 | 重复位置 |
+
+### 2. 动态最小字数 `_MIN_LEN_BY_TRIGGER`
+
+为防止高频教学口语标记（如 `然后`/`之后`/`我们来`）在短片段中过度碎切，对特定触发词要求左右各至少 N 字符才允许切分：
+
+| 触发词 | 最小左右字数 |
+|--------|------------|
+| 然后 | 6 |
+| 之后/完成之后/做好之后 | 5 |
+| 我们来/我们再来/来看一下 | 5 |
+| 其他 | 3 |
+
+### 3. 递归切割
+
+对子块递归应用上述规则，至无可用切点或切分后子块违反动态字数约束。
+
+### 应答词保护列表
+
+以下词独立成块（不与其他合并，也不被切分）：
+好/对/嗯/是/不/行/哦/啊/呀/喏/嗯哼/好的/对的/明白/知道/可以/没错/是的/不行/好吧/对了/对哦/对啊/嗯嗯/好啦/行了/可以啊/没问题/没事/知道了/明白了/没关系/ok/okay/yes/no/right/sure/yeah/yep/nope/nah/alright/indeed 等 50+ 个
+
+## 清洗算法
+
+清洗分两阶段：
+
+### 预清洗（refine_segments.py 内建）
+
+`_clean_segments()` 在语义切割前执行，过滤 ASR 噪声信号：
+- 空文本段、零时长段、(文本,起始时间) 完全重复段
+
+### 后清洗（cleanup_segments.py）
+
+以 refine 输出的 segments 为基线，通过 cleanup_segments.py 做最终清洗：
+
+cleanup_segments.py
+  ├── 去空文本段（text.strip() == "" 的 segment 直接删除）
+  └── 合并相邻重复段（相邻 segment 文本一致时，扩展前段的 end 时间，删除后段）
+
+后清洗置于 refine 之后，因为 refine 的重复检测（Level 8）会主动将文本切为两份，
+可能导致相邻 segment 内容相同——cleanup 在这一步统一收口合并。
+
+两阶段分工：预清洗处理上游 ASR 的噪声 block，后清洗处理 refine 切分后产生的相邻重复。
 
 ## 失败模式
 
@@ -154,16 +204,31 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 脚本特性：
 - macOS (arm64) → mlx-whisper（Apple GPU）；其他平台 → faster-whisper（CPU/CUDA）
 - 首次运行自动下载模型（约 1.6GB Whisper）至技能目录 `models/`
+- 内置 refine_segments.py（语义断句）和 cleanup_segments.py（去空+去重）流水线
 
-## Step 3: refine_segments.py 语义断句优化
+## Step 3: refine_segments.py 预清洗 + 语义断句优化
 
-在 `raw.srt` 基础上运行内容语义断句（脚本由 transcribe.py 内部调用，也可独立运行验证）：
+在 `raw.srt` 基础上运行 ASR 预清洗（去空/零时长/重复）和内容语义断句（脚本由 transcribe.py 内部调用，也可独立运行验证）：
 
 ```bash
 venv/bin/python3 scripts/refine_segments.py "<output_dir>/tmp/raw.srt"
 ```
 
 输出覆盖 `raw.srt`（时间轴无损）。算法细节见「断句算法」节。
+
+**v2 新增**：内建 `_clean_segments` 预清洗 + 教学口语标记（然后/之后/我们来/来看一下）+ 动态最小字数控制。
+
+## Step 3.5: cleanup_segments.py 清洗
+
+在 refine 之后自动运行（transcribe.py 内部调用），无需手动执行。算法细节见「清洗算法」节。
+
+若需独立验证，也可手动运行：
+
+```bash
+venv/bin/python3 scripts/cleanup_segments.py "<output_dir>/tmp/raw.srt"
+```
+
+输出覆盖 `raw.srt`。
 
 ## 🔴 CHECKPOINT 🛑 STOP: 润色确认
 

@@ -441,6 +441,16 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
         print("refine_segments not available, skipping", file=sys.stderr)
         out = raw_segments
 
+    try:
+        from cleanup_segments import cleanup as cleanup_segs
+        before_c = len(out)
+        out = cleanup_segs(out)
+        if len(out) != before_c:
+            print(f"cleanup_segments: {before_c} → {len(out)} segments (removed empty/duplicate)",
+                  file=sys.stderr)
+    except ImportError:
+        print("cleanup_segments not available, skipping", file=sys.stderr)
+
     print(f"segments: {raw_count} raw segs → {len(out)} segments",
           file=sys.stderr)
     return out
@@ -486,6 +496,16 @@ def transcribe_faster(audio_path: str, model_name: str, language: str | None,
     except ImportError:
         print("refine_segments not available, skipping", file=sys.stderr)
         out = raw_segments
+
+    try:
+        from cleanup_segments import cleanup as cleanup_segs
+        before_c = len(out)
+        out = cleanup_segs(out)
+        if len(out) != before_c:
+            print(f"cleanup_segments: {before_c} → {len(out)} segments (removed empty/duplicate)",
+                  file=sys.stderr)
+    except ImportError:
+        print("cleanup_segments not available, skipping", file=sys.stderr)
 
     print(f"segments: {raw_count} raw segs → {len(out)} segments",
           file=sys.stderr)

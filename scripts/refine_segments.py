@@ -3,8 +3,9 @@
 Refine SRT segments using multi-level cascading semantic split rules.
 
 Pipeline:
-  1. For each segment, find candidate split positions across 6 confidence levels
-  2. Recursively split at balanced positions, proportionally allocate time
+  1. Clean empty / zero-duration / duplicate segments from upstream ASR
+  2. For each segment, find candidate split positions across 6 confidence levels
+  3. Recursively split at balanced positions, proportionally allocate time
 
 No punctuation dependency — split purely on semantic/contextual cues.
 
@@ -23,6 +24,8 @@ from pathlib import Path
 STRONG_CONJUNCTIONS = [
     "但是", "但", "所以", "不过", "然而", "可是", "因此", "因而",
     "而且", "并且", "那如果", "那这样", "那就",
+    # 新增：然后 是教学口语最高频话题转接词
+    "然后",
 ]
 
 DISCOURSE_MARKERS = [
@@ -34,12 +37,16 @@ DISCOURSE_MARKERS = [
     "可以这么说", "换句话说", "反过来说",
     "总的来说", "具体来说", "严格来说",
     "简单来说", "一般来讲", "换句话说",
+    # 新增：教学演示引入语
+    "我们来", "我们再来", "来看一下",
 ]
 
 TEMP_MARKERS = [
     "到时候", "有时候", "接下来",
     "那接下来", "那现在", "现在我们来",
     "我们一起来", "我们现在",
+    # 新增：时序完成后引入新动作
+    "之后", "完成之后", "做好之后",
 ]
 
 TOPIC_SHIFT_FOLLOW = frozenset(
@@ -72,6 +79,19 @@ RESPONSE_TOPIC_PATTERNS = [
     (re.compile(r"对那"), 2),
     (re.compile(r"行那"), 2),
 ]
+
+# 对这些词触发的切点，要求左右各至少这么多字才切
+# 防止 "然后" 把极短片段继续碎切
+_MIN_LEN_BY_TRIGGER: dict[str, int] = {
+    "然后": 6,
+    "之后": 5,
+    "完成之后": 5,
+    "做好之后": 5,
+    "我们来": 5,
+    "我们再来": 5,
+    "来看一下": 5,
+}
+_DEFAULT_MIN_LEN = 3
 
 
 # ── SRT I/O ─────────────────────────────────────────────────────────
@@ -148,6 +168,19 @@ def _strip_punct(text: str) -> str:
 
 def _is_protected(text: str) -> bool:
     return _strip_punct(text) in PROTECTED_WORDS
+
+
+def _min_len_for_pos(text: str, pos: int) -> int:
+    """返回切点 pos 对应的最小左右长度要求。"""
+    for trigger, min_len in _MIN_LEN_BY_TRIGGER.items():
+        tlen = len(trigger)
+        # 触发词出现在切点左侧紧邻（STRONG/TEMP 模式：切在词首）
+        if text[max(0, pos - tlen):pos] == trigger:
+            return min_len
+        # 或切点右侧紧邻（DISCOURSE 模式：切在词尾之后）
+        if text[pos:pos + tlen] == trigger:
+            return min_len
+    return _DEFAULT_MIN_LEN
 
 
 # ── Split point detection ───────────────────────────────────────────
@@ -260,7 +293,6 @@ def _find_split_points(text: str) -> tuple[list[int], list[int]]:
             idx = text.find(tag, idx + 1)
 
     # Level 8: Repetition — leading CJK sequence repeats later in text (MEDIUM)
-    # Extract leading 2-3 CJK characters (ignore spaces/Latin/digits)
     leading_cjk = ""
     for ch in text:
         if not ch.isascii():
@@ -314,8 +346,10 @@ def _split_recursive(seg: dict) -> list[dict]:
     for p in candidates:
         right_text = text[p:].strip()
         left_text = text[:p].strip()
-        left_ok = len(left_text) >= 3 or _is_protected(left_text)
-        right_ok = len(right_text) >= 3 or _is_protected(right_text)
+        # 根据触发词类型动态决定最小长度要求
+        min_len = _min_len_for_pos(text, p)
+        left_ok = len(left_text) >= min_len or _is_protected(left_text)
+        right_ok = len(right_text) >= min_len or _is_protected(right_text)
         if left_ok and right_ok:
             viable.append(p)
 
@@ -342,11 +376,38 @@ def _split_recursive(seg: dict) -> list[dict]:
     return result
 
 
+# ── ASR cleanup ─────────────────────────────────────────────────────
+
+def _clean_segments(segments: list[dict]) -> list[dict]:
+    """
+    过滤上游 ASR 产生的噪声 segment：
+    - 空文本
+    - 零时长（start == end）
+    - (文本, 起始时间) 完全重复的条目
+    """
+    seen: set[tuple[str, float]] = set()
+    clean: list[dict] = []
+    for seg in segments:
+        text = seg["text"].strip()
+        if not text:
+            continue
+        if seg["end"] <= seg["start"]:
+            continue
+        key = (text, round(seg["start"], 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(seg)
+    return clean
+
+
 # ── Main refine pipeline ────────────────────────────────────────────
 
 def refine(segments: list[dict]) -> list[dict]:
     if not segments:
         return []
+
+    segments = _clean_segments(segments)
 
     split_segs = []
     for seg in segments:
@@ -377,11 +438,14 @@ def main():
         print(f"error: no valid segments in {input_path}", file=sys.stderr)
         sys.exit(1)
 
+    original_count = len(segs)
     out = refine(segs)
     output_path = args.output or str(input_path)
     write_srt(out, output_path)
+
+    cleaned_count = len([s for s in segs])  # after _clean_segments inside refine
     print(
-        f"refined {len(segs)} → {len(out)} segments → {output_path}",
+        f"refined {original_count} → {len(out)} segments → {output_path}",
         file=sys.stderr,
     )
 
