@@ -1,6 +1,6 @@
 # Video Transcribe
 
-视频音频转录为字幕 Agent Skill — Whisper 转写 + 语义断句 + 可选润色 + 可选翻译，输出高精度 SRT 字幕文件。
+视频音频转录为字幕 Agent Skill — Whisper 转写 + 语义断句 + [可选润色](https://github.com/zzh-editor/Srt-Enhancer) + 可选翻译，输出高精度 SRT 字幕文件。
 
 ## 触发词
 
