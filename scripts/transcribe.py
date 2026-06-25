@@ -298,7 +298,7 @@ def _migrate_model_cache(models_dir: str):
 
 # ── VAD (Silero VAD for mlx) ───────────────────────────────────────
 
-def _vad_split_mlx(audio_path: str, min_segment_s: float = 0.5,
+def _vad_split_mlx(audio_path: str, min_segment_s: float = 1.0,
                    merge_gap_s: float = 1.0) -> list[dict]:
     """Split audio into VAD-based speech segments. Returns list of (start, end) in seconds."""
     import soundfile as sf
@@ -366,6 +366,8 @@ def _transcribe_vad_chunks(audio_path: str, model_name: str, language: str | Non
                 language=language,
                 word_timestamps=True,
                 initial_prompt=INITIAL_PROMPT_ZH if language and language.startswith("zh") else None,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.6,
             )
             for seg in result.get("segments", []):
                 seg["start"] += vs['start']

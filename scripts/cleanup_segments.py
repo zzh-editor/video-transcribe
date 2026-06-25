@@ -14,7 +14,35 @@ Usage:
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
+
+
+# ── Hallucination detection ──────────────────────────────────────────
+
+MIN_HALLUCINATION_LEN = 30   # minimum length to check for loops
+MIN_UNIQUE_CHARS_RATIO = 0.04  # unique chars / total length below this = loop
+
+KNOWN_HALLUCINATIONS = frozenset({
+    "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
+})
+
+
+def _is_repeat_loop(text: str) -> bool:
+    """Detect VAD hallucination loops (repeating chars, bigrams, or tiny vocabulary)."""
+    chars = text.replace(" ", "").replace("\u200b", "")
+    if len(chars) < MIN_HALLUCINATION_LEN:
+        return False
+
+    n_unique = len(set(chars))
+    # Very small vocabulary relative to length → repetition loop
+    if n_unique / len(chars) < MIN_UNIQUE_CHARS_RATIO:
+        return True
+    # Very few unique characters overall → almost certainly a loop
+    if n_unique <= 2 and len(chars) >= MIN_HALLUCINATION_LEN:
+        return True
+
+    return False
 
 
 def cleanup(segments: list[dict]) -> list[dict]:
@@ -25,6 +53,11 @@ def cleanup(segments: list[dict]) -> list[dict]:
     non_empty = [s for s in segments if s.get("text", "").strip()]
     if not non_empty:
         return []
+
+    # Step 1.5: remove hallucinated segments
+    non_empty = [s for s in non_empty
+                 if not _is_repeat_loop(s.get("text", ""))
+                 and s["text"].strip() not in KNOWN_HALLUCINATIONS]
 
     # Step 2: merge consecutive segments with identical text (case-insensitive)
     merged: list[dict] = [non_empty[0]]

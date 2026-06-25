@@ -1,17 +1,17 @@
 [
   {
     "id": 1,
-    "prompt": "转录这个视频 /Users/rubber/Downloads/test.mp4",
-    "expected": "提取音频 → Whisper 转写 → refine_segments 断句 → 输出 raw.srt → 润色确认"
+    "prompt": "转录这个文件 ~/Downloads/lecture.mp4，语言是中文",
+    "expected": "提取音频 → Whisper 转写 → refine_segments 断句 → cleanup 清洗 → raw.srt → 润色确认 → 无翻译（zh detected）→ 输出 _zh.srt"
   },
   {
     "id": 2,
-    "prompt": "把这段音频转成中英双语字幕 /Users/rubber/Downloads/interview.wav",
-    "expected": "Whisper 转写 → 检测英文 → 翻译确认 → 中上原下格式输出"
+    "prompt": "把这个英文播客转成双语字幕 ~/Downloads/podcast.wav",
+    "expected": "Whisper 转写 → refine_segments → cleanup → raw.srt → 润色确认 → 翻译确认（非 zh）→ 中上原下翻译 → 输出 _en_Enhance.srt 或 _en.srt"
   },
   {
     "id": 3,
-    "prompt": "转录这个 Maya 教程视频并润色字幕 /Users/rubber/Downloads/maya_tutorial.mp4",
-    "expected": "Whisper 转写 → refine_segments → srt-enhancer 润色（domain_scanner 检测 maya 领域 → 联网校准术语 → enhance.py --skip refine）"
+    "prompt": "转录这个 3D 教程并润色字幕 ~/Downloads/blender_tutorial.mp4",
+    "expected": "Whisper 转写 → refine_segments → cleanup → raw.srt → 润色确认 → srt-enhancer（domain_scanner → AI config → 联网校准 → enhance.py --skip refine → 复核 → diff 审核）→ 翻译确认 → 输出 _Enhance.srt"
   }
 ]
