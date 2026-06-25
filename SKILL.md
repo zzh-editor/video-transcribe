@@ -135,6 +135,7 @@ cleanup_segments.py
 |---------|---------|-----------|
 | `ffmpeg` 未安装 | macOS → `brew install ffmpeg`，Ubuntu → `sudo apt install ffmpeg`，Windows → `winget install ffmpeg` | 停止执行，告知用户手动安装后重试 |
 | ffmpeg 提取失败 | 检查输入文件是否存在、格式是否支持 | 转换为 WAV 后重试：`ffmpeg -i input -vn -ar 16000 -ac 1 output.wav` |
+| refine_segments.py 执行失败（非空输入仍报错） | 检查 raw.srt 格式、校验 refine_segments.py 日志 | 跳过语义断句，使用 Whisper 原始 segments 作为 raw.srt 基线 |
 | `import mlx_whisper` 失败（macOS） | `venv/bin/pip install mlx-whisper` | 检查 Python ≥ 3.8 且为 Apple Silicon 芯片 |
 | `from faster_whisper import WhisperModel` 失败（其他平台） | `venv/bin/pip install faster-whisper` | 检查 Python ≥ 3.8 |
 | Whisper 模型下载失败 | 检查网络、重试 | 确保网络可访问 HuggingFace，或手动下载模型至 `models/` |
@@ -150,6 +151,7 @@ cleanup_segments.py
 | 联网校准搜索失败（超时/无结果） | 跳过联网校准，使用本地 correction-table.md | 未匹配术语标注 ❗ 低置信度（50-69%）提交用户确认 |
 | 联网校准搜索结果无权威来源 | 跳过该术语修正，标注 ❗ | 保留原文，标记 `#unverified` |
 | srt-enhancer 子步骤被跳过（未执行 domain detection 或 web calibration） | 回退到 Step 4 重新执行完整子步骤清单 | 跳过润色，以 raw.srt 为基线 |
+| AI 翻译执行失败（上下文超限/超时/输出格式异常） | 减小每批翻译量（每次 5 条 SRT 条目）、重试 | 跳过翻译，以未翻译的 final.srt 作为最终输出 |
 
 **变量约定**：以下命令中 `<input>` 为用户提供的输入文件路径，`<output_dir>` 为输入文件所在目录（`dirname <input>`）。所有脚本路径相对于技能目录 `~/.config/opencode/skills/video-transcribe/`。
 
