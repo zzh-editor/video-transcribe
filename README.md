@@ -41,6 +41,73 @@ git pull origin main  # 更新
 
 > 需要 Python 3.8+ 和 ffmpeg。
 
+## 使用方式
+
+所有转录任务只用一句话描述需求 + 文件路径，Agent 自动处理后输出 SRT。
+
+### 基础转录
+
+```
+用户：转录这个视频 lecture.mov
+Agent：检测到视频文件 → 提取音频 → Whisper 转写（平台自适应）
+       语义断句 → 清洗 → 输出 SRT
+       🔴 CHECKPOINT: 是否调用 srt-enhancer 润色？
+       └── 否 → 写入 lecture.srt
+```
+
+```
+用户：把 meeting.mp4 转成字幕
+Agent：检测到音频/视频文件 → 转录流水线
+       输出 raw.srt → 用户确认后写入与输入同目录
+```
+
+### 转录 + 润色
+
+```
+用户：转录 podcast.mp3 打开润色
+Agent：检测到音频文件 → 转录 → 语义断句
+       🔴 CHECKPOINT: 已安装 srt-enhancer，调用润色
+       去口癖 / ASR 纠错 / 混排空格 → 输出润色后 SRT
+```
+
+如果尚未安装 srt-enhancer，Agent 会在 CHECKPOINT 询问是否安装。
+
+### 转录 + 翻译
+
+```
+用户：转录 tutorial.mp4 翻译成中文
+Agent：检测到视频 → 转录 → 语义断句
+       🔴 CHECKPOINT: 用户确认翻译
+       逐段翻译 → 输出纯中文 SRT
+```
+
+```
+用户：转录 interview.mp4 中上原下
+Agent：检测到视频 → 转录 → 语义断句
+       翻译模式设为「中上原下」
+       │ 第一行原文（英文）
+       │ 第二行译文（中文）
+       输出双语 SRT
+```
+
+```
+用户：转录 talk.mp4 原上中下
+Agent：检测到视频 → 转录 → 语义断句
+       翻译模式设为「原上中下」
+       │ 第一行译文（中文）
+       │ 第二行原文（英文）
+       输出双语 SRT
+```
+
+### 长音频 / 强制分片
+
+```
+用户：转录 long_recording.wav 启用 VAD
+Agent：检测到音频文件（超过 30 分钟）
+       启用 Silero VAD 精准切割静音段
+       逐片转录 → 语义断句 → 输出 SRT
+```
+
 ## 工作流程
 
 ```
@@ -99,35 +166,6 @@ git pull origin main  # 更新
 `video-transcribe` 包含 2 个强制用户确认检查点（🔴 CHECKPOINT）：
 - **润色确认**：srt-enhancer 存在时询问是否调用，不存在时询问是否安装
 - **翻译确认**：含内容验证（校验 `tmp/final.srt` 非空 + 预览前 5 条）+ 语种判断 + 翻译模式选择
-
-## 直接调用脚本
-
-```bash
-# 基础转录
-venv/bin/python3 scripts/transcribe.py audio.wav \
-  --output raw.srt \
-  --language zh \
-  --max-line-length 25 \
-  --max-line-ms 6000
-
-# 强制启用 VAD（≥30 分钟长音频推荐）
-venv/bin/python3 scripts/transcribe.py audio.wav \
-  --output raw.srt \
-  --language zh \
-  --vad
-
-# 强制关闭 VAD
-venv/bin/python3 scripts/transcribe.py audio.wav \
-  --output raw.srt \
-  --language zh \
-  --no-vad
-
-# 独立运行语义断句验证
-venv/bin/python3 scripts/refine_segments.py raw.srt
-
-# 独立运行后清洗验证
-venv/bin/python3 scripts/cleanup_segments.py raw.srt
-```
 
 ## 脚本
 
