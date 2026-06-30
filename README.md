@@ -70,7 +70,7 @@ Agent：检测到音频文件 → 转录 → 语义断句
        去口癖 / ASR 纠错 / 混排空格 → 输出润色后 SRT
 ```
 
-如果尚未安装 srt-enhancer，Agent 会在 CHECKPOINT 询问是否安装。
+如果尚未安装 [srt-enhancer](https://github.com/zzh-editor/Srt-Enhancer)，Agent 会在 CHECKPOINT 询问是否安装。
 
 ### 转录 + 翻译
 
