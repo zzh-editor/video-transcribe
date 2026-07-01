@@ -2,6 +2,7 @@
 name: video-transcribe
 description: "视频音频转录为字幕。输入视频/音频本地文件，提取音频 → Whisper 转写（macOS 用 MLX 加速，其他用 faster-whisper） → 可选调用 srt-enhancer 润色 → 可选翻译（纯中文/中上原下/原上中下）→ 输出高精度 SRT 字幕文件。触发词：转录、转录音频、转录视频、转录字幕、把文件转成字幕、把音频转录成字幕、把视频转录成字幕、transcribe、transcribe audio、transcribe video、generate subtitles、generate srt、convert to srt"
 allowed-tools: [Read, Write, Edit, Bash, Glob, Grep]
+version: 3.0.0
 ---
 
 # video-transcribe
@@ -63,32 +64,6 @@ allowed-tools: [Read, Write, Edit, Bash, Glob, Grep]
 ```
 
 首次运行 `bash scripts/setup.sh` 自动创建 venv 并安装依赖。Whisper 模型约 1.6GB，首次使用时自动下载至 `models/` 目录（`HF_HOME` 指向此目录）。卸载技能时可一并清除。
-
-## 失败模式
-
-| 触发条件 | 一线修复 | 仍失败兜底 |
-|---------|---------|-----------|
-| `ffmpeg` 未安装 | macOS → `brew install ffmpeg`，Ubuntu → `sudo apt install ffmpeg`，Windows → `winget install ffmpeg` | 停止执行，告知用户手动安装后重试 |
-| ffmpeg 提取失败 | 检查输入文件是否存在、格式是否支持 | 转换为 WAV 后重试：`ffmpeg -i input -vn -ar 16000 -ac 1 output.wav` |
-| refine_segments.py 执行失败（非空输入仍报错） | 检查 raw.srt 格式、校验 refine_segments.py 日志 | 跳过语义断句，使用 Whisper 原始 segments 作为 raw.srt 基线 |
-| `import mlx_whisper` 失败（macOS） | `venv/bin/pip install mlx-whisper` | 检查 Python ≥ 3.8 且为 Apple Silicon 芯片 |
-| `from faster_whisper import WhisperModel` 失败（其他平台） | `venv/bin/pip install faster-whisper` | 检查 Python ≥ 3.8 |
-| Whisper 模型下载失败 | 检查网络、重试 | 确保网络可访问 HuggingFace，或手动下载模型至 `models/` |
-| `import silero_vad_notorch` 失败 | `venv/bin/pip install silero-vad-notorch onnxruntime` | 降级为整段 Whisper 转录（无 VAD 分片） |
-| VAD 分片失败（onnxruntime 推理异常） | `venv/bin/pip install --upgrade onnxruntime` | 降级为整段 Whisper 转录（无 VAD 分片） |
-| VAD 分片后无有效语音段 | 检查音频是否为纯音乐/噪音 | 自动降级为整段转录 |
-| 转写内存不足 | 关闭其他应用后重试 | 确保 8GB+ RAM |
-| srt-enhancer 不存在 | 用 Question 询问用户是否安装（`npx skills@latest install https://github.com/zzh-editor/Srt-Enhancer`） | 用户同意则安装后进入 Step 4，拒绝则跳过润色 |
-| srt-enhancer 安装失败 | 检查网络和 npx 是否可用 | 跳过润色，以 raw.srt 为基线 |
-| srt-enhancer 调用失败 | 检查 enhance.py 日志输出 | 跳过润色，以 raw.srt 为基线 |
-| srt-enhancer 输出异常（空文件/乱码） | 检查 enhance.py 日志输出 | 跳过润色，以 raw.srt 为基线 |
-| domain_scanner.py 执行失败 | 回退到 AI 关键词扫描，使用 `general` 领域 | 跳过领域检测，以 `general` 继续 |
-| 联网校准搜索失败（超时/无结果） | 跳过联网校准，使用本地 correction-table.md | 未匹配术语标注 ❗ 低置信度（50-69%）提交用户确认 |
-| 联网校准搜索结果无权威来源 | 跳过该术语修正，标注 ❗ | 保留原文，标记 `#unverified` |
-| srt-enhancer 子步骤被跳过（未执行 domain detection 或 web calibration） | 回退到 Step 4 重新执行完整子步骤清单 | 跳过润色，以 raw.srt 为基线 |
-| AI 翻译执行失败（上下文超限/超时/输出格式异常） | 减小每批翻译量（每次 5 条 SRT 条目）、重试 | 跳过翻译，以未翻译的 final.srt 作为最终输出 |
-
-**变量约定**：以下命令中 `<input>` 为用户提供的输入文件路径，`<output_dir>` 为输入文件所在目录（`dirname <input>`）。所有脚本路径相对于技能目录 `~/.config/opencode/skills/video-transcribe/`。
 
 ## Step 0: 环境初始化
 
@@ -371,6 +346,30 @@ fi
 - `models/` — Whisper 模型缓存
 
 AI 处理完成后可清理 `tmp/` 目录。
+
+## 失败模式
+
+| 触发条件 | 一线修复 | 仍失败兜底 |
+|---------|---------|-----------|
+| `ffmpeg` 未安装 | macOS → `brew install ffmpeg`，Ubuntu → `sudo apt install ffmpeg`，Windows → `winget install ffmpeg` | 停止执行，告知用户手动安装后重试 |
+| ffmpeg 提取失败 | 检查输入文件是否存在、格式是否支持 | 转换为 WAV 后重试：`ffmpeg -i input -vn -ar 16000 -ac 1 output.wav` |
+| refine_segments.py 执行失败（非空输入仍报错） | 检查 raw.srt 格式、校验 refine_segments.py 日志 | 跳过语义断句，使用 Whisper 原始 segments 作为 raw.srt 基线 |
+| `import mlx_whisper` 失败（macOS） | `venv/bin/pip install mlx-whisper` | 检查 Python ≥ 3.8 且为 Apple Silicon 芯片 |
+| `from faster_whisper import WhisperModel` 失败（其他平台） | `venv/bin/pip install faster-whisper` | 检查 Python ≥ 3.8 |
+| Whisper 模型下载失败 | 检查网络、重试 | 确保网络可访问 HuggingFace，或手动下载模型至 `models/` |
+| `import silero_vad_notorch` 失败 | `venv/bin/pip install silero-vad-notorch onnxruntime` | 降级为整段 Whisper 转录（无 VAD 分片） |
+| VAD 分片失败（onnxruntime 推理异常） | `venv/bin/pip install --upgrade onnxruntime` | 降级为整段 Whisper 转录（无 VAD 分片） |
+| VAD 分片后无有效语音段 | 检查音频是否为纯音乐/噪音 | 自动降级为整段转录 |
+| 转写内存不足 | 关闭其他应用后重试 | 确保 8GB+ RAM |
+| srt-enhancer 不存在 | 用 Question 询问用户是否安装（`npx skills@latest install https://github.com/zzh-editor/Srt-Enhancer`） | 用户同意则安装后进入 Step 4，拒绝则跳过润色 |
+| srt-enhancer 安装失败 | 检查网络和 npx 是否可用 | 跳过润色，以 raw.srt 为基线 |
+| srt-enhancer 调用失败 | 检查 enhance.py 日志输出 | 跳过润色，以 raw.srt 为基线 |
+| srt-enhancer 输出异常（空文件/乱码） | 检查 enhance.py 日志输出 | 跳过润色，以 raw.srt 为基线 |
+| domain_scanner.py 执行失败 | 回退到 AI 关键词扫描，使用 `general` 领域 | 跳过领域检测，以 `general` 继续 |
+| 联网校准搜索失败（超时/无结果） | 跳过联网校准，使用本地 correction-table.md | 未匹配术语标注 ❗ 低置信度（50-69%）提交用户确认 |
+| 联网校准搜索结果无权威来源 | 跳过该术语修正，标注 ❗ | 保留原文，标记 `#unverified` |
+| srt-enhancer 子步骤被跳过（未执行 domain detection 或 web calibration） | 回退到 Step 4 重新执行完整子步骤清单 | 跳过润色，以 raw.srt 为基线 |
+| AI 翻译执行失败（上下文超限/超时/输出格式异常） | 减小每批翻译量（每次 5 条 SRT 条目）、重试 | 跳过翻译，以未翻译的 final.srt 作为最终输出 |
 
 ---
 
