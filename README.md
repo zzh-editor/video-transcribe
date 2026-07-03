@@ -1,6 +1,6 @@
 # Video Transcribe
 
-视频/音频转录为 SRT 字幕的工具。提取音频 → Whisper 转写 → 语义断句 → 可选润色 → 可选翻译，输出高精度字幕。
+视频/音频转录为 SRT 字幕的工具。提取音频 → Whisper 转写 → 语义断句 → [可选润色](https://github.com/zzh-editor/Srt-Enhancer) → 可选翻译，输出高精度字幕。
 
 平台自适应：macOS arm64 用 mlx-whisper（Apple GPU 加速），其他平台用 faster-whisper。VAD 智能分片 + ASR 降噪，长音频稳定转录。
 
