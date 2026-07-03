@@ -75,7 +75,7 @@ video-transcribe/
 
 **必需：** ffmpeg、Python 3.8+、mlx-whisper（macOS）/ faster-whisper（其他）、silero-vad-notorch、onnxruntime
 
-**可选：** srt-enhancer（润色功能）
+**可选：** [srt-enhancer（润色功能）](https://github.com/zzh-editor/Srt-Enhancer)
 
 ## License
 
