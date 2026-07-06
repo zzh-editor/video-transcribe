@@ -23,23 +23,7 @@ from pathlib import Path
 
 # ── Constants ──────────────────────────────────────────────────────
 
-SENTENCE_END = frozenset(".?!。？！…")
-SOFT_BREAK = frozenset(",;:，；：、—")
 INITIAL_PROMPT_ZH = "以下是普通话的句子，使用简体中文书写。"
-CONJUNCTIONS = [
-    "然后", "所以", "但是", "不过", "而且", "另外", "还有", "接下来",
-    "but", "and", "so", "however", "then", "because", "also",
-]
-
-PROTECTED_WORDS = frozenset({
-    "好", "对", "嗯", "是", "不", "行", "哦", "啊", "呀", "喏",
-    "嗯哼",
-    "好的", "对的", "明白", "知道", "可以", "没错", "是的", "不行",
-    "好吧", "对了", "对哦", "对啊", "嗯嗯", "好啦", "行了", "可以啊",
-    "没问题", "没事", "知道了", "明白了", "没关系",
-    "ok", "okay", "yes", "no", "right", "sure", "yeah", "yep",
-    "nope", "nah", "alright", "indeed",
-})
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -56,14 +40,6 @@ def get_pause_threshold(language: str | None) -> float:
     if language and language.startswith(("zh", "ja", "ko")):
         return 0.3
     return 0.5
-
-
-def _strip_punct(text: str) -> str:
-    return text.strip().lower().rstrip(",.?!。？！，、；:\"'").strip()
-
-
-def is_protected(text: str) -> bool:
-    return _strip_punct(text) in PROTECTED_WORDS
 
 
 def get_model_path() -> str:
@@ -91,17 +67,6 @@ def get_audio_duration(path: str) -> float:
     return 0.0
 
 
-# ── Word data ──────────────────────────────────────────────────────
-
-class Word:
-    __slots__ = ("start", "end", "word", "probability")
-    def __init__(self, start: float, end: float, word: str, probability: float = 1.0):
-        self.start = start
-        self.end = end
-        self.word = word
-        self.probability = probability
-
-
 # ── Raw segment processing ─────────────────────────────────────────
 
 def _normalize_segments(segments: list) -> list[dict]:
@@ -125,161 +90,7 @@ def _normalize_segments(segments: list) -> list[dict]:
     return out
 
 
-def _extract_word_list(words: list) -> list[Word]:
-    flat = []
-    for w in words:
-        if isinstance(w, dict):
-            flat.append(Word(
-                w.get("start", 0.0), w.get("end", 0.0),
-                w.get("word", ""), w.get("probability", 1.0),
-            ))
-        else:
-            flat.append(Word(
-                getattr(w, "start", 0.0),
-                getattr(w, "end", 0.0),
-                getattr(w, "word", ""),
-                getattr(w, "probability", 1.0),
-            ))
-    return flat
-
-
-def _find_cut(words: list[Word], max_chars: int) -> int | None:
-    best = None
-    run_chars = 0
-    for i, w in enumerate(words):
-        wlen = len(w.word.strip().replace(" ", ""))
-        if run_chars + wlen > max_chars:
-            break
-        run_chars += wlen
-        if w.word.strip() and w.word.strip()[-1] in SOFT_BREAK:
-            best = i
-    if best is not None:
-        return best
-
-    run_chars = 0
-    for conj in CONJUNCTIONS:
-        run_chars = 0
-        for i, w in enumerate(words):
-            wlen = len(w.word.strip().replace(" ", ""))
-            run_chars += wlen
-            if run_chars > max_chars:
-                break
-            if w.word.strip().startswith(conj) and i > 0:
-                return i - 1
-
-    best_gap, best_j = 0.15, None
-    for j in range(len(words) - 1):
-        gap = words[j + 1].start - words[j].end
-        if gap > best_gap:
-            best_gap, best_j = gap, j
-    if best_j is not None:
-        return best_j
-
-    run_chars = 0
-    for i, w in enumerate(words):
-        wlen = len(w.word.strip().replace(" ", ""))
-        if run_chars + wlen >= max_chars and i > 0:
-            return i - 1
-        run_chars += wlen
-
-    return None
-
-
-def _split_by_ratio(seg: dict, max_chars: int, max_line_ms: int) -> list[dict]:
-    text = seg["text"]
-    chars = len(text.replace(" ", ""))
-    duration = seg["end"] - seg["start"]
-    max_dur = max_line_ms / 1000
-
-    n_pieces = max(
-        (chars + max_chars - 1) // max_chars,
-        int(duration / max_dur) + 1,
-    )
-    n_pieces = max(n_pieces, 1)
-
-    if n_pieces <= 1:
-        return [seg]
-
-    result = []
-    char_pos = 0
-    start_time = seg["start"]
-    target_chars = chars // n_pieces
-
-    for i in range(n_pieces):
-        if i == n_pieces - 1:
-            piece_text = text[char_pos:].strip()
-        else:
-            end_char = min(char_pos + target_chars, len(text))
-            for c in range(end_char, max(char_pos, end_char - 6), -1):
-                c = min(c, len(text) - 1)
-                if c > char_pos and text[c:c + 1] in "，、。？！；：":
-                    end_char = c + 1
-                    break
-            piece_text = text[char_pos:end_char].strip()
-            char_pos = end_char
-
-        if piece_text:
-            ratio = len(piece_text.replace(" ", "")) / max(chars, 1)
-            end_time = seg["start"] + duration * ratio
-            result.append({"start": start_time, "end": end_time, "text": piece_text,
-                           "words": []})
-            start_time = end_time
-
-    return result
-
-
-def _split_long_segment(seg: dict, max_chars: int, max_line_ms: int) -> list[dict]:
-    word_list = _extract_word_list(seg.get("words", []))
-    if not word_list:
-        return _split_by_ratio(seg, max_chars, max_line_ms)
-
-    result = []
-    cur = []
-
-    for w in word_list:
-        wtext = w.word.strip()
-        if not wtext:
-            continue
-
-        cur.append(w)
-
-        cur_text = "".join(x.word for x in cur).replace("\u200b", "").strip()
-        cur_chars = len(cur_text.replace(" ", ""))
-        cur_dur = cur[-1].end - cur[0].start
-
-        if cur_chars >= max_chars or cur_dur >= max_line_ms / 1000:
-            cut = _find_cut(cur, max_chars)
-            if cut is not None and cut < len(cur) - 1:
-                head = cur[:cut + 1]
-                cur = cur[cut + 1:]
-            else:
-                if cur_chars > max_chars and len(cur) > 2:
-                    head = cur[:-1]
-                    cur = [cur[-1]]
-                else:
-                    mid = max(1, len(cur) // 2)
-                    head = cur[:mid]
-                    cur = cur[mid:]
-
-            ht = "".join(x.word for x in head).replace("\u200b", "").strip()
-            if ht:
-                result.append({"start": head[0].start, "end": head[-1].end,
-                               "text": ht, "words": []})
-
-    if cur:
-        ct = "".join(x.word for x in cur).replace("\u200b", "").strip()
-        if ct:
-            result.append({"start": cur[0].start, "end": cur[-1].end,
-                           "text": ct, "words": []})
-
-    return result if result else [{
-        "start": seg["start"], "end": seg["end"],
-        "text": seg["text"], "words": [],
-    }]
-
-
 # ── Model cache migration ──────────────────────────────────────────
-
 def _migrate_model_cache(models_dir: str):
     default_hub = Path.home() / ".cache/huggingface/hub"
     old_model_dir = default_hub / "models--mlx-community--whisper-large-v2-mlx"
@@ -435,9 +246,10 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
     try:
         from refine_segments import refine as refine_segs
         before = len(raw_segments)
-        out = refine_segs(raw_segments)
+        out = refine_segs(raw_segments, max_chars=max_line_length,
+                          max_line_ms=max_line_ms)
         if len(out) != before:
-            print(f"refine_segments: {before} → {len(out)} segments (semantic merge/split)",
+            print(f"refine_segments: {before} → {len(out)} segments (semantic + length split)",
                   file=sys.stderr)
     except ImportError:
         print("refine_segments not available, skipping", file=sys.stderr)
@@ -491,9 +303,10 @@ def transcribe_faster(audio_path: str, model_name: str, language: str | None,
     try:
         from refine_segments import refine as refine_segs
         before = len(raw_segments)
-        out = refine_segs(raw_segments)
+        out = refine_segs(raw_segments, max_chars=max_line_length,
+                          max_line_ms=max_line_ms)
         if len(out) != before:
-            print(f"refine_segments: {before} → {len(out)} segments (semantic merge/split)",
+            print(f"refine_segments: {before} → {len(out)} segments (semantic + length split)",
                   file=sys.stderr)
     except ImportError:
         print("refine_segments not available, skipping", file=sys.stderr)
@@ -546,8 +359,10 @@ def main():
                         help="max duration per subtitle block in ms (default: 6000)")
     parser.add_argument("--pause-ms", type=int, default=None,
                         help="pause threshold for sentence split in ms (default: 300 zh / 500 en)")
-    parser.add_argument("--engine", choices=["auto", "mlx", "faster-whisper"],
+    parser.add_argument("--engine", choices=["auto", "mlx", "faster-whisper", "groq"],
                         default="auto", help="force a specific engine")
+    parser.add_argument("--groq-api-key", default=None,
+                        help="Groq API key (required when --engine groq)")
     parser.add_argument("--vad", action="store_true", default=None,
                         help="enable VAD pre-splitting (Silero VAD for mlx, vad_filter for faster)")
     parser.add_argument("--no-vad", action="store_true", default=None,
@@ -576,6 +391,21 @@ def main():
     plat = detect_platform()
 
     engine = args.engine
+
+    if engine == "groq":
+        if not args.groq_api_key:
+            print("error: --groq-api-key is required when --engine groq", file=sys.stderr)
+            sys.exit(1)
+        from groq_transcribe import transcribe_groq
+        segments = transcribe_groq(
+            str(audio_path),
+            api_key=args.groq_api_key,
+            language=lang,
+        )
+        write_srt(segments, output_path)
+        print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
+        return output_path
+
     if engine == "auto":
         if plat["is_macos"] and plat["is_arm"]:
             engine = "mlx"
