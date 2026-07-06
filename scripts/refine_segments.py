@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Refine SRT segments using multi-level cascading semantic split rules.
+Refine SRT segments using word-level timestamps for scoring-driven segmentation.
+
+Scoring engine replaces the old 6-level cascading semantic split + character-ratio
+time allocation. Each gap between adjacent words is scored based on:
+  - Punctuation at gap boundary
+  - Silence/pause duration
+  - Line length/time driver
+  - Bad break penalties (dangling conjunctions, orphaned prepositions)
+  - Fragmentation penalty
 
 Pipeline:
   1. Clean empty / zero-duration / duplicate segments from upstream ASR
-  2. For each segment, find candidate split positions across 6 confidence levels
-  3. Recursively split at balanced positions, proportionally allocate time
-
-No punctuation dependency — split purely on semantic/contextual cues.
+  2. Score-based segmentation using word timestamps
+  3. Output segments with accurate per-word timing
 
 Usage:
     python3 scripts/refine_segments.py <input.srt> [output.srt]
@@ -21,80 +27,353 @@ from pathlib import Path
 
 # ── Constants ────────────────────────────────────────────────────────
 
-STRONG_CONJUNCTIONS = [
-    "但是", "但", "所以", "不过", "然而", "可是", "因此", "因而",
-    "而且", "并且", "那如果", "那这样", "那就",
-    # 新增：然后 是教学口语最高频话题转接词
-    "然后",
-]
+STRONG_PUNCT = frozenset("。！？.?!…")
+WEAK_PUNCT = frozenset("，、；：,:;")
 
-DISCOURSE_MARKERS = [
-    "首先", "其次", "然后", "接着",
-    "另外", "还有", "此外", "同样",
-    "比如说", "举个例子", "比方说",
-    "说白了", "也就是说", "所以说", "就是说",
-    "那首先",
-    "可以这么说", "换句话说", "反过来说",
-    "总的来说", "具体来说", "严格来说",
-    "简单来说", "一般来讲", "换句话说",
-    # 新增：教学演示引入语
-    "我们来", "我们再来", "来看一下",
-]
-
-TEMP_MARKERS = [
-    "到时候", "有时候", "接下来",
-    "那接下来", "那现在", "现在我们来",
-    "我们一起来", "我们现在",
-    # 新增：时序完成后引入新动作
-    "之后", "完成之后", "做好之后",
-]
-
-TOPIC_SHIFT_FOLLOW = frozenset(
-    "我们大家你们他们这个这些现在今天首先"
-    "第二第三接下来到时候如果"
-)
-
-PROTECTED_WORDS = frozenset({
-    "好", "对", "嗯", "是", "不", "行", "哦", "啊", "呀", "喏", "嗯哼",
-    "好的", "对的", "明白", "知道", "可以", "没错", "是的", "不行",
-    "好吧", "对了", "对哦", "对啊", "嗯嗯", "好啦", "行了", "可以啊",
-    "没问题", "没事", "知道了", "明白了", "没关系",
-    "ok", "okay", "okay", "yes", "no", "right", "sure", "yeah", "yep",
-    "nope", "nah", "alright", "indeed",
+# Words that should NOT appear at the start of a subtitle line
+# (prepositions/subordinating conjunctions that make viewers feel
+#  the line starts mid-sentence)
+BAD_LINE_START = frozenset({
+    "在", "对", "给", "为", "把", "被", "从", "向",
+    "和", "与", "跟", "同", "及",
+    "关于", "对于", "根据", "经过", "通过", "除了",
+    "因为", "但是", "所以", "不过", "然而", "而且", "并且",
+    "如果", "虽然", "尽管", "由于", "为了", "除非",
+    "当", "随着", "作为",
+    "那", "那么",
+    "for", "to", "with", "about", "because", "but", "so",
+    "and", "then", "however", "although",
 })
 
-SPLIT_BEFORE_TAGS = [
-    "是吧", "对吧", "好吧", "没问题", "没错",
-    "是的", "对啊", "对哦", "好啦", "行了",
-    "可以啊", "就这样", "就是这样",
-    "它是", "这是一个",
-]
+# Words that should NOT appear at the end of a subtitle line
+# (dangling conjunctions)
+BAD_LINE_END = frozenset({
+    "因为", "但是", "所以", "然后", "不过",
+    "然而", "而且", "并且",
+    "如果", "虽然", "尽管", "由于",
+    "because", "but", "so", "and", "then", "however",
+})
 
-RESPONSE_TOPIC_PATTERNS = [
-    (re.compile(r"好那"), 2),
-    (re.compile(r"好现在"), 1),
-    (re.compile(r"好那我们"), 2),
-    (re.compile(r"好我们"), 1),
-    (re.compile(r"好接下来"), 1),
-    (re.compile(r"对那"), 2),
-    (re.compile(r"行那"), 2),
-]
+# Words that are GOOD to have at line start
+# (topic markers / teaching discourse markers)
+GOOD_LINE_START = frozenset({
+    "首先", "其次", "然后", "接着",
+    "另外", "还有", "此外", "同样",
+    "比如说", "举个例子", "说白了",
+    "也就是说", "所以说",
+    "我们来", "我们再来", "来看一下",
+    "到时候", "有时候", "接下来",
+})
 
-# 对这些词触发的切点，要求左右各至少这么多字才切
-# 防止 "然后" 把极短片段继续碎切
-_MIN_LEN_BY_TRIGGER: dict[str, int] = {
-    "然后": 6,
-    "之后": 5,
-    "完成之后": 5,
-    "做好之后": 5,
-    "我们来": 5,
-    "我们再来": 5,
-    "来看一下": 5,
-}
-_DEFAULT_MIN_LEN = 3
+_DEFAULT_MAX_CHARS = 25
+_DEFAULT_MAX_LINE_MS = 4000
+_DEFAULT_MIN_LINE_CHARS = 8
 
 
-# ── SRT I/O ─────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def _chars(words: list[dict]) -> int:
+    """Count visual characters, excluding spaces and zero-width spaces."""
+    return sum(
+        len(w.get("word", "").replace(" ", "").replace("\u200b", ""))
+        for w in words
+    )
+
+
+def _to_segment(words: list[dict]) -> dict:
+    """Build a segment dict from a slice of word timestamps."""
+    return {
+        "start": words[0]["start"],
+        "end": words[-1]["end"],
+        "text": "".join(w.get("word", "") for w in words).strip(),
+        "words": words,
+    }
+
+
+def _detect_language(words: list[dict]) -> str:
+    """Quick language detection from words. Returns 'zh' or 'en'."""
+    for w in words:
+        for ch in w.get("word", ""):
+            if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
+                return "zh"
+    return "en"
+
+
+def _clean_words(words: list[dict]) -> list[dict]:
+    """Remove malformed word entries (empty text, missing/zero timestamps)."""
+    clean = []
+    for w in words:
+        text = w.get("word", "").strip()
+        start = w.get("start")
+        end = w.get("end")
+        if not text or start is None or end is None:
+            continue
+        if end <= start:
+            continue
+        clean.append(w)
+    return clean
+
+
+# ── Scoring ─────────────────────────────────────────────────────────
+
+def _score_gap(
+    left: dict, right: dict,
+    line_chars: int, line_dur: float,
+    max_chars: int, max_dur: float,
+    pause_threshold: float,
+) -> float:
+    """Score a gap between two words as a candidate split point.
+    Higher score = better place to split.
+    """
+    score = 0.0
+    left_word = left.get("word", "").strip()
+    right_word = right.get("word", "").strip().lower()
+
+    # 1. Punctuation bonus
+    if left_word and left_word[-1] in STRONG_PUNCT:
+        score += 5.0
+    elif left_word and left_word[-1] in WEAK_PUNCT:
+        score += 3.0
+
+    # 2. Silence/pause bonus
+    gap = right.get("start", 0) - left.get("end", 0)
+    if gap >= pause_threshold:
+        score += 4.0
+    elif gap >= pause_threshold * 0.5:
+        score += 1.0
+
+    # 3. Length driver — line getting long, encourage a break
+    if line_dur > max_dur or line_chars > max_chars:
+        score += 2.0
+
+    # 4. Right-side word is bad at line start → penalty
+    if right_word in BAD_LINE_START:
+        score -= 4.0
+    #    Right-side word is good at line start → bonus
+    elif right_word in GOOD_LINE_START:
+        score += 1.0
+
+    # 5. Left-side word is bad at line end → penalty
+    if left_word.lower() in BAD_LINE_END:
+        score -= 4.0
+
+    # 6. Fragmentation penalty — line too short without strong signal
+    if line_chars < _DEFAULT_MIN_LINE_CHARS and score < 3:
+        score -= 2.0
+
+    return score
+
+
+# ── Segmentation engine ─────────────────────────────────────────────
+
+def _segment_words(
+    words: list[dict],
+    max_chars: int = _DEFAULT_MAX_CHARS,
+    max_dur: float = _DEFAULT_MAX_LINE_MS / 1000.0,
+    pause_threshold: float = 0.3,
+) -> list[dict]:
+    """
+    Score-driven subtitle segmentation with natural break detection.
+
+    Two-phase approach:
+      1. Pre-compute 'natural break' positions — gaps with strong
+         punctuation or significant pause. These are preferred split points.
+      2. Walk through words; split at the best available point when
+         constraints are exceeded OR when a natural break provides a
+         well-sized line.
+    """
+    if not words:
+        return []
+
+    n = len(words)
+
+    # Phase 1: pre-compute natural break positions
+    natural_breaks: set[int] = set()
+    for i in range(1, n):
+        gap = words[i]["start"] - words[i - 1]["end"]
+        left_char = words[i - 1]["word"].strip()[-1:] if words[i - 1]["word"].strip() else ""
+        if (left_char and left_char[0] in STRONG_PUNCT) or gap >= pause_threshold:
+            natural_breaks.add(i)
+
+    lines: list[dict] = []
+    start = 0
+
+    while start < n:
+        best_score = -999.0
+        best_end = start + 1
+        pending_break = None  # natural break too early; wait for line to grow
+
+        for end in range(start + 1, n + 1):
+            chunk = words[start:end]
+            chunk_chars = _chars(chunk)
+            chunk_dur = chunk[-1]["end"] - chunk[0]["start"]
+
+            # Record first natural break position regardless of line size
+            if end in natural_breaks and pending_break is None:
+                pending_break = end
+
+            # Use pending break when line is substantial and within limits
+            if pending_break is not None:
+                pre_chars = _chars(words[start:pending_break])
+                pre_dur = words[pending_break - 1]["end"] - words[start]["start"]
+                if pre_chars >= max_chars // 2 and pre_chars <= max_chars and pre_dur <= max_dur:
+                    best_end = pending_break
+                    break
+
+            # Still within limits — keep accumulating
+            if chunk_chars <= max_chars and chunk_dur <= max_dur:
+                best_end = end
+                continue
+
+            # Overflow: evaluate all possible cuts
+            for cut in range(start + 1, end):
+                pre = words[start:cut]
+                pre_chars = _chars(pre)
+                if pre_chars < 1:
+                    continue
+                s = _score_gap(
+                    words[cut - 1], words[cut],
+                    pre_chars,
+                    pre[-1]["end"] - pre[0]["start"],
+                    max_chars, max_dur, pause_threshold,
+                )
+                if s >= best_score:
+                    best_score = s
+                    best_end = cut
+
+            # If overflow has a scored candidate, use it
+            if best_score <= -999.0 and pending_break is not None:
+                best_end = pending_break
+            break
+
+        # Safety: always advance at least one word
+        if best_end <= start:
+            best_end = start + 1
+
+        lines.append(_to_segment(words[start:best_end]))
+        start = best_end
+
+    return lines
+
+
+# ── ASR cleanup ──────────────────────────────────────────────────────
+
+def _clean_segments(segments: list[dict]) -> list[dict]:
+    """Filter out ASR noise: empty text, zero duration, exact duplicates."""
+    seen: set[tuple[str, float]] = set()
+    clean: list[dict] = []
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        if seg.get("end", 0) <= seg.get("start", 0):
+            continue
+        key = (text, round(seg["start"], 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(seg)
+    return clean
+
+
+# ── Fallback (for CLI / segments without word timestamps) ───────────
+
+def _fallback_split(
+    seg: dict,
+    max_chars: int = _DEFAULT_MAX_CHARS,
+    max_line_ms: int = _DEFAULT_MAX_LINE_MS,
+) -> list[dict]:
+    """Simple punctuation+ratio split for segments without word timestamps."""
+    text = seg.get("text", "").strip()
+    if not text:
+        return []
+
+    chars = len(text.replace(" ", ""))
+    duration = seg["end"] - seg["start"]
+    max_dur = max_line_ms / 1000.0
+
+    if chars <= max_chars and duration <= max_dur:
+        return [seg]
+
+    n_pieces = max(
+        (chars + max_chars - 1) // max_chars,
+        int(duration / max_dur) + 1,
+        1,
+    )
+    result = []
+    char_pos = 0
+    start_time = seg["start"]
+    target_chars = chars // n_pieces
+
+    for i in range(n_pieces):
+        if i == n_pieces - 1:
+            piece_text = text[char_pos:].strip()
+        else:
+            end_char = min(char_pos + target_chars, len(text))
+            for c in range(end_char, max(char_pos, end_char - 6), -1):
+                c = min(c, len(text) - 1)
+                if c > char_pos and text[c:c+1] in "，、。？！；：":
+                    end_char = c + 1
+                    break
+            piece_text = text[char_pos:end_char].strip()
+            char_pos = end_char
+
+        if piece_text:
+            ratio = len(piece_text.replace(" ", "")) / max(chars, 1)
+            end_time = start_time + duration * ratio
+            result.append({
+                "start": start_time, "end": end_time,
+                "text": piece_text, "words": [],
+            })
+            start_time = end_time
+
+    return result
+
+
+# ── Main refine pipeline ────────────────────────────────────────────
+
+def refine(
+    segments: list[dict],
+    max_chars: int = _DEFAULT_MAX_CHARS,
+    max_line_ms: int = _DEFAULT_MAX_LINE_MS,
+) -> list[dict]:
+    """
+    Refine ASR segments into well-timed subtitles using scoring-driven
+    segmentation with word-level timestamps.
+
+    Args:
+        segments: List of segment dicts with 'start', 'end', 'text', 'words'
+        max_chars: Max characters per subtitle line
+        max_line_ms: Max duration per subtitle line in milliseconds
+
+    Returns:
+        Refined segment list with accurate per-line timing
+    """
+    if not segments:
+        return []
+
+    segments = _clean_segments(segments)
+    max_dur = max_line_ms / 1000.0
+
+    out: list[dict] = []
+    for seg in segments:
+        words = seg.get("words")
+        if not words:
+            # No word timestamps — fallback for CLI usage
+            out.extend(_fallback_split(seg, max_chars, max_line_ms))
+        else:
+            words = _clean_words(words)
+            if len(words) < 2:
+                out.append(_to_segment(words) if words else seg)
+                continue
+            lang = _detect_language(words)
+            pause_th = 0.3 if lang == "zh" else 0.5
+            out.extend(_segment_words(words, max_chars, max_dur, pause_th))
+
+    return out
+
+
+# ── SRT I/O (CLI only) ──────────────────────────────────────────────
 
 def parse_srt(path: str) -> list[dict]:
     segments: list[dict] = []
@@ -108,13 +387,12 @@ def parse_srt(path: str) -> list[dict]:
             i += 1
             continue
         if line.isdigit():
-            idx = int(line)
             i += 1
             if i >= len(lines):
                 break
             ts = lines[i].strip()
             i += 1
-            text_lines = []
+            text_lines: list[str] = []
             while i < len(lines) and lines[i].strip():
                 text_lines.append(lines[i].strip())
                 i += 1
@@ -130,10 +408,7 @@ def parse_srt(path: str) -> list[dict]:
                 end = (int(m[5]) * 3600 + int(m[6]) * 60 + int(m[7])
                        + int(m[8]) / 1000)
                 segments.append({
-                    "idx": idx,
-                    "start": start,
-                    "end": end,
-                    "text": text,
+                    "start": start, "end": end, "text": text, "words": [],
                 })
             i += 1
         else:
@@ -160,272 +435,19 @@ def write_srt(segments: list[dict], path: str):
             f.write(f"{seg['text']}\n\n")
 
 
-# ── Helpers ─────────────────────────────────────────────────────────
-
-def _strip_punct(text: str) -> str:
-    return text.strip().lower().rstrip(",.?!。？！，、；:\"'").strip()
-
-
-def _is_protected(text: str) -> bool:
-    return _strip_punct(text) in PROTECTED_WORDS
-
-
-def _min_len_for_pos(text: str, pos: int) -> int:
-    """返回切点 pos 对应的最小左右长度要求。"""
-    for trigger, min_len in _MIN_LEN_BY_TRIGGER.items():
-        tlen = len(trigger)
-        # 触发词出现在切点左侧紧邻（STRONG/TEMP 模式：切在词首）
-        if text[max(0, pos - tlen):pos] == trigger:
-            return min_len
-        # 或切点右侧紧邻（DISCOURSE 模式：切在词尾之后）
-        if text[pos:pos + tlen] == trigger:
-            return min_len
-    return _DEFAULT_MIN_LEN
-
-
-# ── Split point detection ───────────────────────────────────────────
-
-def _is_split_viable(text: str, pos: int) -> bool:
-    if pos < 1 or pos >= len(text) - 1:
-        return False
-    right_start = text[pos]
-    if right_start.isascii() and (right_start.isalpha() or right_start.isdigit()):
-        return False
-    return True
-
-
-def _is_topic_shift_na(text: str, pos: int) -> bool:
-    if pos + 1 >= len(text):
-        return False
-    if pos > 0 and text[pos - 1] == "好":
-        return True
-    nxt = text[pos + 1]
-    if nxt in TOPIC_SHIFT_FOLLOW:
-        return True
-    nxt2 = text[pos + 1:pos + 3]
-    if nxt2 in ("就是", "还是", "也是", "算是", "的话", "这么", "那么"):
-        return False
-    return nxt in "，"
-
-
-def _find_response_topic_splits(text: str) -> list[int]:
-    splits = []
-    for pattern, split_offset in RESPONSE_TOPIC_PATTERNS:
-        m = pattern.search(text)
-        while m:
-            p = m.start() + split_offset
-            if _is_split_viable(text, p):
-                splits.append(p)
-            m = pattern.search(text, m.start() + 1)
-    return splits
-
-
-def _find_split_points(text: str) -> tuple[list[int], list[int]]:
-    """Return (strong_split_positions, all_split_positions) sorted."""
-    strong = set()
-    all_pts = set()
-
-    if not text:
-        return [], []
-
-    n = len(text)
-
-    # Level 1: Strong conjunctions mid-text (STRONG)
-    for conj in STRONG_CONJUNCTIONS:
-        idx = text.find(conj, 1)
-        while idx > 0:
-            if _is_split_viable(text, idx):
-                strong.add(idx)
-                all_pts.add(idx)
-            idx = text.find(conj, idx + 1)
-
-    # Level 2: Topic shift 那 (STRONG)
-    idx = text.find("那", 1)
-    while idx > 0:
-        if _is_split_viable(text, idx) and _is_topic_shift_na(text, idx):
-            strong.add(idx)
-            all_pts.add(idx)
-        idx = text.find("那", idx + 1)
-
-    # Level 3: Discourse markers (STRONG) — skip position 0 to avoid standalone 首先/然后
-    for marker in DISCOURSE_MARKERS:
-        idx = text.find(marker, 1)
-        while idx >= 0:
-            split_pos = idx + len(marker)
-            if split_pos < n - 1 and _is_split_viable(text, split_pos):
-                strong.add(split_pos)
-                all_pts.add(split_pos)
-            idx = text.find(marker, idx + 1)
-
-    # Level 4: Temporal markers (STRONG)
-    for marker in TEMP_MARKERS:
-        idx = text.find(marker, 1)
-        while idx > 0:
-            if _is_split_viable(text, idx):
-                strong.add(idx)
-                all_pts.add(idx)
-            idx = text.find(marker, idx + 1)
-
-    # Level 5: Response + topic patterns (STRONG)
-    for p in _find_response_topic_splits(text):
-        strong.add(p)
-        all_pts.add(p)
-
-    # Level 6: OK isolation (MEDIUM)
-    for ok_word in ("OK", "ok", "Okay", "Ok"):
-        idx = text.find(ok_word)
-        while idx >= 0:
-            ok_end = idx + len(ok_word)
-            ok_end_char = text[ok_end] if ok_end < n else " "
-            if ok_end <= n and (ok_end >= n or ok_end_char in "，。？！\n "):
-                if ok_end < n:
-                    all_pts.add(ok_end)
-                elif idx > 2:
-                    all_pts.add(idx)
-            idx = text.find(ok_word, idx + 1)
-
-    # Level 7: Split BEFORE response tags (MEDIUM)
-    for tag in SPLIT_BEFORE_TAGS:
-        idx = text.find(tag, 1)
-        while idx > 0:
-            if _is_split_viable(text, idx):
-                all_pts.add(idx)
-            idx = text.find(tag, idx + 1)
-
-    # Level 8: Repetition — leading CJK sequence repeats later in text (MEDIUM)
-    leading_cjk = ""
-    for ch in text:
-        if not ch.isascii():
-            leading_cjk += ch
-            if len(leading_cjk) >= 2:
-                break
-    if len(leading_cjk) >= 2:
-        cjk_positions = [(i, ch) for i, ch in enumerate(text) if not ch.isascii()]
-        cjk_only = "".join(ch for _, ch in cjk_positions)
-        if len(cjk_only) >= len(leading_cjk):
-            second = cjk_only.find(leading_cjk, len(leading_cjk))
-            if second > 0 and second < len(cjk_positions):
-                orig_pos = cjk_positions[second][0]
-                if _is_split_viable(text, orig_pos):
-                    all_pts.add(orig_pos)
-
-    min_left = 1
-    min_right = 2
-    strong_sorted = sorted(p for p in strong if min_left <= p <= n - min_right)
-    all_sorted = sorted(p for p in all_pts if min_left <= p <= n - min_right)
-
-    return strong_sorted, all_sorted
-
-
-# ── Recursive splitting ─────────────────────────────────────────────
-
-def _score_split(text: str, pos: int, text_len: int) -> float:
-    """Score a split position — lower is better."""
-    ratio = pos / text_len if text_len > 0 else 0.5
-    if ratio < 0.3:
-        return 0.3 - ratio
-    elif ratio > 0.7:
-        return ratio - 0.7
-    return 0
-
-
-def _split_recursive(seg: dict) -> list[dict]:
-    """Recursively split segment at semantic split points."""
-    text = seg["text"].strip()
-    if not text:
-        return [seg]
-
-    text_len = len(text)
-    strong_pts, all_pts = _find_split_points(text)
-
-    candidates = list(strong_pts) if strong_pts else list(all_pts)
-    if not candidates:
-        return [seg]
-
-    viable = []
-    for p in candidates:
-        right_text = text[p:].strip()
-        left_text = text[:p].strip()
-        # 根据触发词类型动态决定最小长度要求
-        min_len = _min_len_for_pos(text, p)
-        left_ok = len(left_text) >= min_len or _is_protected(left_text)
-        right_ok = len(right_text) >= min_len or _is_protected(right_text)
-        if left_ok and right_ok:
-            viable.append(p)
-
-    if not viable:
-        return [seg]
-
-    best = min(viable, key=lambda p: _score_split(text, p, text_len))
-
-    left_text = text[:best].strip()
-    right_text = text[best:].strip()
-    if not left_text or not right_text:
-        return [seg]
-
-    ratio = len(left_text) / text_len if text_len > 0 else 0.5
-    duration = seg["end"] - seg["start"]
-    split_time = seg["start"] + duration * ratio
-
-    left_seg = {"text": left_text, "start": seg["start"], "end": split_time}
-    right_seg = {"text": right_text, "start": split_time, "end": seg["end"]}
-
-    result = []
-    result.extend(_split_recursive(left_seg))
-    result.extend(_split_recursive(right_seg))
-    return result
-
-
-# ── ASR cleanup ─────────────────────────────────────────────────────
-
-def _clean_segments(segments: list[dict]) -> list[dict]:
-    """
-    过滤上游 ASR 产生的噪声 segment：
-    - 空文本
-    - 零时长（start == end）
-    - (文本, 起始时间) 完全重复的条目
-    """
-    seen: set[tuple[str, float]] = set()
-    clean: list[dict] = []
-    for seg in segments:
-        text = seg["text"].strip()
-        if not text:
-            continue
-        if seg["end"] <= seg["start"]:
-            continue
-        key = (text, round(seg["start"], 3))
-        if key in seen:
-            continue
-        seen.add(key)
-        clean.append(seg)
-    return clean
-
-
-# ── Main refine pipeline ────────────────────────────────────────────
-
-def refine(segments: list[dict]) -> list[dict]:
-    if not segments:
-        return []
-
-    segments = _clean_segments(segments)
-
-    split_segs = []
-    for seg in segments:
-        sub = _split_recursive(seg)
-        split_segs.extend(sub)
-
-    return split_segs
-
-
 # ── CLI ─────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Refine SRT segments using content-based semantic analysis"
+        description="Refine SRT segments using word-level timestamps"
     )
     parser.add_argument("input", help="input SRT file path")
     parser.add_argument("output", nargs="?",
                         help="output SRT file path (default: overwrite input)")
+    parser.add_argument("--max-chars", type=int, default=_DEFAULT_MAX_CHARS,
+                        help=f"max characters per line (default: {_DEFAULT_MAX_CHARS})")
+    parser.add_argument("--max-line-ms", type=int, default=_DEFAULT_MAX_LINE_MS,
+                        help=f"max duration per line in ms (default: {_DEFAULT_MAX_LINE_MS})")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -439,13 +461,12 @@ def main():
         sys.exit(1)
 
     original_count = len(segs)
-    out = refine(segs)
+    out = refine(segs, max_chars=args.max_chars, max_line_ms=args.max_line_ms)
     output_path = args.output or str(input_path)
     write_srt(out, output_path)
-
-    cleaned_count = len([s for s in segs])  # after _clean_segments inside refine
     print(
-        f"refined {original_count} → {len(out)} segments → {output_path}",
+        f"refined {original_count} → {len(out)} segments "
+        f"(max_chars={args.max_chars}) → {output_path}",
         file=sys.stderr,
     )
 
