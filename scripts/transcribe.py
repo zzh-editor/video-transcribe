@@ -254,62 +254,8 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
     except ImportError:
         print("refine_segments not available, skipping", file=sys.stderr)
         out = raw_segments
-
-    try:
-        from cleanup_segments import cleanup as cleanup_segs
-        before_c = len(out)
-        out = cleanup_segs(out)
-        if len(out) != before_c:
-            print(f"cleanup_segments: {before_c} → {len(out)} segments (removed empty/duplicate)",
-                  file=sys.stderr)
-    except ImportError:
-        print("cleanup_segments not available, skipping", file=sys.stderr)
-
-    print(f"segments: {raw_count} raw segs → {len(out)} segments",
-          file=sys.stderr)
-    return out
-
-
-def transcribe_faster(audio_path: str, model_name: str, language: str | None,
-                      max_line_length: int, pause_threshold: float,
-                      max_line_ms: int, vad: bool = False) -> list[dict]:
-    models_dir = get_model_path()
-    os.environ.setdefault("HF_HOME", models_dir)
-
-    from faster_whisper import WhisperModel
-
-    print(f"engine: faster-whisper", file=sys.stderr)
-    print(f"model: {model_name}", file=sys.stderr)
-    print(f"device: CPU", file=sys.stderr)
-    print(f"vad_filter: {vad}", file=sys.stderr)
-    print(f"transcribing: {audio_path}", file=sys.stderr)
-
-    t0 = time.time()
-    model = WhisperModel(model_name, device="cpu", compute_type="int8",
-                         download_root=models_dir)
-    seg_iter, info = model.transcribe(
-        audio_path, language=language,
-        word_timestamps=True,
-        vad_filter=vad,
-        initial_prompt=INITIAL_PROMPT_ZH if language and language.startswith("zh") else None,
-    )
-    elapsed = time.time() - t0
-    print(f"transcription took {elapsed:.1f}s", file=sys.stderr)
-    print(f"detected language: {info.language}", file=sys.stderr)
-
-    raw_segments = list(seg_iter)
-    raw_count = len(raw_segments)
-
-    try:
-        from refine_segments import refine as refine_segs
-        before = len(raw_segments)
-        out = refine_segs(raw_segments, max_chars=max_line_length,
-                          max_line_ms=max_line_ms)
-        if len(out) != before:
-            print(f"refine_segments: {before} → {len(out)} segments (semantic + length split)",
-                  file=sys.stderr)
-    except ImportError:
-        print("refine_segments not available, skipping", file=sys.stderr)
+    except Exception:
+        print("refine_segments error, skipping", file=sys.stderr)
         out = raw_segments
 
     try:
@@ -321,6 +267,8 @@ def transcribe_faster(audio_path: str, model_name: str, language: str | None,
                   file=sys.stderr)
     except ImportError:
         print("cleanup_segments not available, skipping", file=sys.stderr)
+    except Exception:
+        print("cleanup_segments error, skipping", file=sys.stderr)
 
     print(f"segments: {raw_count} raw segs → {len(out)} segments",
           file=sys.stderr)
@@ -402,6 +350,21 @@ def main():
             api_key=args.groq_api_key,
             language=lang,
         )
+        try:
+            from refine_segments import refine as refine_segs
+            segments = refine_segs(segments, max_chars=args.max_line_length,
+                                   max_line_ms=args.max_line_ms)
+        except ImportError:
+            pass
+        except Exception:
+            print("refine_segments error, skipping", file=sys.stderr)
+        try:
+            from cleanup_segments import cleanup as cleanup_segs
+            segments = cleanup_segs(segments)
+        except ImportError:
+            pass
+        except Exception:
+            print("cleanup_segments error, skipping", file=sys.stderr)
         write_srt(segments, output_path)
         print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
         return output_path

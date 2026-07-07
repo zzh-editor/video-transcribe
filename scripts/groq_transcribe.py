@@ -34,7 +34,6 @@ def transcribe_groq(
     data: dict = {
         "model": model,
         "response_format": "verbose_json",
-        "timestamp_granularities": ["word", "segment"],
     }
     if language:
         data["language"] = language

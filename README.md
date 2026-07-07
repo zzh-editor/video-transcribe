@@ -56,7 +56,6 @@ generate subtitles / generate srt / convert to srt
 | ASR 降噪 | logprob_threshold=-1.0 + no_speech_threshold=0.6 |
 | 评分引擎断句 | 基于 word timestamps + pause/标点评分的断句算法 |
 | 幻觉检测 | 重复字符循环过滤，黑名单模式 |
-| 应答词保护 | 50+ 应答词独立成块，不合并 |
 | 可选润色 | 调用 srt-enhancer 去口癖/纠错/空格 |
 | 可选翻译 | AI 逐段翻译，支持 3 种排版模式 |
 | 配置持久化 | 引擎选择、API Key 首次运行保存至 config.json |
@@ -76,8 +75,15 @@ video-transcribe/
 ## 依赖
 
 **必需：** ffmpeg、Python 3.8+
-  - 本地模型：mlx-whisper（macOS）/ faster-whisper（其他）、silero-vad-notorch、onnxruntime
-  - Groq API：requests、Groq API Key
+
+**转录引擎（至少选一个）：**
+- mlx-whisper（macOS arm64 本地模型）
+- faster-whisper（其他平台本地模型）
+- requests + API Key（Groq API）
+
+**本地模型优化（可选，失败自动降级）：**
+- silero-vad-notorch + onnxruntime（macOS 长音频 VAD 预分片）
+- soundfile（macOS 音频加载）
 
 **可选：** [srt-enhancer（润色功能）](https://github.com/zzh-editor/Srt-Enhancer)
 

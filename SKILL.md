@@ -29,7 +29,7 @@ version: 3.0.0
       │   _clean_segments 去空/零时长/重复 → word-timestamp 评分引擎（pause/natural break/scored cuts）+ pending_break 回退 + duration 保护
       ▼
 ⑤ cleanup_segments.py 后清洗
-      │   合并相邻重复（refine 的重复检测切分后收口）
+      │   合并相邻重复（VAD 边界重叠 + 幻觉检测）
       ▼
 ⑥ raw.srt ← 原始 SRT
       │
@@ -135,7 +135,7 @@ ffmpeg -i "<input>" -vn -ar 16000 -ac 1 "<output_dir>/tmp/audio.wav"
 
 ## Step 2: 转写
 
-从 `config.json` 读取转录引擎。用户可在当前提示中覆盖（如「这次用 API」）。
+参考第 0.5 步 `config.json` 确定的引擎，执行转写（此为 LLM Agent 工作流指令，`transcribe.py` 本身通过 `--engine` CLI 参数选择引擎）。
 
 ### 使用本地模型 (engine=local)
 
@@ -152,7 +152,7 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 **高级选项：**
 
 ```bash
-# 强制启用 VAD（≥30 分钟长音频必须开启，<10 分钟自动关闭）
+# 强制启用 VAD（≥10 分钟长音频建议开启，<10 分钟自动关闭）
 venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --output "<output_dir>/tmp/raw.srt" \
   --language zh \
@@ -163,6 +163,12 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --output "<output_dir>/tmp/raw.srt" \
   --language zh \
   --no-vad
+
+# 自定义断句停顿阈值（默认 300ms 中文 / 500ms 英文）
+venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
+  --output "<output_dir>/tmp/raw.srt" \
+  --language zh \
+  --pause-ms 500
 ```
 
 脚本特性：
@@ -189,12 +195,16 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 
 注意事项：
 - 音频文件不得超过 **25MB**（Groq 免费层限制），超过时提示用户改用本地模型
-- Groq API 返回完整 word timestamps，refine_segments 的评分引擎正常运作
 - 无需 VAD 分片（API 服务端处理）
 
 ## Step 3: refine_segments.py 预清洗 + 语义断句优化
 
-在 `raw.srt` 基础上运行 ASR 预清洗（去空/零时长/重复）和内容语义断句（脚本由 transcribe.py 内部调用，也可独立运行验证）：
+由 `transcribe.py` 在内存中对 Whisper 原始 segments 执行（写入 `raw.srt` 之前），两步合一次调用：
+
+1. `_clean_segments()` — 去空文本/零时长/完全重复（ASR 噪声过滤）
+2. `_segment_words()` — word-timestamp 评分引擎断句（自然停顿/溢出分割 + pending_break 回退）
+
+也可独立调用仅做诊断验证：
 
 ```bash
 venv/bin/python3 scripts/refine_segments.py "<output_dir>/tmp/raw.srt"
@@ -204,7 +214,10 @@ venv/bin/python3 scripts/refine_segments.py "<output_dir>/tmp/raw.srt"
 
 ## Step 3.5: cleanup_segments.py 清洗
 
-在 refine 之后自动运行（transcribe.py 内部调用），无需手动执行。算法细节见附录「清洗算法」。
+由 `transcribe.py` 在 refine 之后、写入 `raw.srt` 之前自动执行，无感运行。主要职责：
+- 合并 VAD 分片边界重叠产生的相邻重复段（同一词出现在两片交界处）
+- 检测并移除 VAD 静音段幻觉循环（如重复的"请不吝点赞 订阅 转发"模式）
+- 去空文本段（与 refine 的预清洗冗余，做安全兜底）
 
 若需独立验证，也可手动运行：
 
@@ -402,19 +415,24 @@ fi
 ### 必需
 - **ffmpeg**：音频提取
 - **Python 3.8+**
-- **mlx-whisper**（macOS arm64）：`venv/bin/pip install mlx-whisper`
-- **faster-whisper**（其他平台）：`venv/bin/pip install faster-whisper`
-- **silero-vad-notorch**（VAD 分片，无 torch 依赖）：`venv/bin/pip install silero-vad-notorch`
+
+### 转录引擎（至少选一个）
+- **mlx-whisper**（macOS arm64 本地模型）：`venv/bin/pip install mlx-whisper`
+- **faster-whisper**（其他平台本地模型）：`venv/bin/pip install faster-whisper`
+- **requests** + API Key（Groq API）：`venv/bin/pip install requests`
+
+### 本地模型优化（可选，失败自动降级）
+- **silero-vad-notorch**（macOS 长音频 VAD 预分片）：`venv/bin/pip install silero-vad-notorch`
 - **onnxruntime**（VAD 推理引擎）：`venv/bin/pip install onnxruntime`
-- **soundfile**（音频加载）：`venv/bin/pip install soundfile`
-- **socksio**（如配置了 SOCKS 代理）：`venv/bin/pip install socksio`
-- **模型**：
-  - whisper-large-v2 约 1.6GB
-  - Silero VAD ONNX 约 2.3MB
+- **soundfile**（macOS 音频加载，mlx 必需）：`venv/bin/pip install soundfile`
+- **socksio**（代理支持）：`venv/bin/pip install socksio`
+
+### 模型
+- whisper-large-v2 约 1.6GB（本地模型引擎使用）
+- Silero VAD ONNX 约 2.3MB（VAD 优化使用）
 
 ### 可选
 - **srt-enhancer**：独立润色技能，位于 `~/.config/opencode/skills/srt-enhancer/`
-- **requests**：Groq API 调用（脚本自动安装至 venv）
 
 ## 临时文件
 
@@ -448,8 +466,8 @@ AI 处理完成后可清理 `tmp/` 目录。
 | AI 翻译执行失败（上下文超限/超时/输出格式异常） | 减小每批翻译量（每次 5 条 SRT 条目）、重试 | 跳过翻译，以未翻译的 final.srt 作为最终输出 |
 | Groq API 文件 >25MB | 提示用户改用本地模型或自行压缩音频 | 用 Question 询问是否切换本地模型 |
 | Groq API Key 无效 (401) | 提示检查 API Key | 用 Question 询问是否重新输入 Key |
-| Groq 网络超时 (600s) | 重试（最多 2 次） | 建议切换本地模型 |
-| Groq 速率限制 (429) | 等待 30s 后重试 | 建议切换本地模型 |
+| Groq 网络超时 (600s) | 提示连接超时 | 建议切换本地模型 |
+| Groq 速率限制 (429) | 提示频率超限，稍后再试 | 建议切换本地模型 |
 | Groq API 连接失败 | 检查网络连接 | 建议切换本地模型 |
 | `requests` 未安装（Groq 模式） | `venv/bin/pip install requests` | 切换本地模型 |
 | config.json 损坏或格式无效 | 提示检查 JSON 格式，展示预期结构 | 用 Question 询问是否重新执行引擎选择流程 |
@@ -458,46 +476,74 @@ AI 处理完成后可清理 `tmp/` 目录。
 
 ## 附录: 断句算法
 
-以 Whisper raw segments 为基线，通过 refine_segments.py 做预清洗 + 语义断句优化：
+以 Whisper raw segments 为基线，通过 refine_segments.py 做预清洗 + 评分引擎断句：
 
 ### 0. 预清洗 `_clean_segments`
+
 进入断句前先过滤 ASR 噪声：
 - 空文本段（`text.strip() == ""`）
 - 零时长段（`start == end`）
 - (文本, 起始时间) 完全重复段
 
-### 1. 语义切割（6 级置信度，级联匹配）
+### 1. 评分引擎 `_segment_words`（word timestamps 主路径）
 
-| 级别 | 类型 | 触发词 | 切分位置 |
-|------|------|--------|---------|
-| **STRONG** | 强连词 | 但是/但/所以/不过/然而/可是/因此/因而/而且/并且/那如果/那这样/那就/**然后** | 词首 |
-| **STRONG** | 话题标记 | 那（智能区分话题标记 vs 限定词） | 词首 |
-| **STRONG** | 话语标记 | 首先/其次/然后/接着/另外/还有/此外/同样/比如说/说白了/也就是说/所以说/**我们来/**我们再来/**来看一下** 等 | 词尾后 |
-| **STRONG** | 时间标记 | 到时候/有时候/接下来/那接下来/那现在/现在我们来/我们一起来/**之后/完成之后/做好之后** | 词首 |
-| **STRONG** | 回应+话题模式 | 好那/好现在/好那我们/好我们/好接下来/对那/行那 | 正则匹配偏移 |
-| **MEDIUM** | OK/语气词隔离 | OK/ok/Okay | 词尾 |
-| **MEDIUM** | 回应标签前切分 | 是吧/对吧/好吧/没问题/没错/是的/就这样 等 | 词首 |
-| **MEDIUM** | 重复检测 | 前 2 CJK 字符在文本中再次出现 | 重复位置 |
+对于有 `words` 字段的 segment，使用评分引擎逐词扫描确定断点：
 
-### 2. 动态最小字数 `_MIN_LEN_BY_TRIGGER`
+#### 1a. 自然断点（`natural_breaks`）
 
-为防止高频教学口语标记（如 `然后`/`之后`/`我们来`）在短片段中过度碎切，对特定触发词要求左右各至少 N 字符才允许切分：
+在词间停顿 ≥ 阈值时标记，覆盖以下来源：
+- **静音停顿**：`words[i].start - words[i-1].end >= pause_threshold`（中文 300ms，英文 500ms）
+- **强标点结尾**：左词末尾字符为 `。！？.?!…`（标点奖励在评分中叠加）
 
-| 触发词 | 最小左右字数 |
-|--------|------------|
-| 然后 | 6 |
-| 之后/完成之后/做好之后 | 5 |
-| 我们来/我们再来/来看一下 | 5 |
-| 其他 | 3 |
+#### 1b. `pending_break` 延迟断点机制
 
-### 3. 递归切割
+自然断点出现在行过短（`chunk_chars < _DEFAULT_MIN_LINE_CHARS=8`）时，不立即切分，而是记录位置；当行长度达到 `max_chars // 2` 时，使用最早记录的自然断点位置切分。此机制保证：
+- 不因短行过早切分
+- 不会错过自然断点
+- 保留最早的自然停顿位置（不覆盖）
 
-对子块递归应用上述规则，至无可用切点或切分后子块违反动态字数约束。
+#### 1c. 溢出评分 `_score_gap`
 
-### 应答词保护列表
+当 `pre_chars > max_chars` 或 `pre_dur > max_dur` 时触发溢出，遍历 `[start+1, end)` 所有可能切点，按 6 维度打分：
 
-以下词独立成块（不与其他合并，也不被切分）：
-好/对/嗯/是/不/行/哦/啊/呀/喏/嗯哼/好的/对的/明白/知道/可以/没错/是的/不行/好吧/对了/对哦/对啊/嗯嗯/好啦/行了/可以啊/没问题/没事/知道了/明白了/没关系/ok/okay/yes/no/right/sure/yeah/yep/nope/nah/alright/indeed 等 50+ 个
+| 维度 | 条件 | 分值 | 说明 |
+|------|------|------|------|
+| 强标点 | 左词末位 `。！？.?!…` | `+5` | 句末强分割 |
+| 弱标点 | 左词末位 `，、；：,;:` | `+3` | 语气停顿 |
+| 静音停顿 | gap ≥ threshold | `+4` | 实际语速停顿 |
+| 半停顿 | gap ≥ 0.5 × threshold | `+1` | 轻微停顿 |
+| 行长度 | pre_chars ≥ max_chars//2 | `+2` | 行够长时倾向切分 |
+| 不良行首 | 右词在 `BAD_LINE_START` | `-4` | 避免以连接词/语气词开头 |
+| 不良行尾 | 左词在 `BAD_LINE_END` | `-4` | 避免以助词/介词结尾 |
+| 碎片行 | pre_chars < 8 且分数 < 3 | `-2` | 避免过短行 |
+
+取最高分切点。若所有切点分数均 ≤ -999（即无一合法），且存在 `pending_break`，则回退到 `pending_break` 位置。
+
+#### 1d. `correct_edge` 边界修正
+
+切分后检查左块末词和右块首词：
+- 若右块首词在 `BAD_LINE_START` 或左块末词在 `BAD_LINE_END`，尝试偏移一个词
+- 最多偏移 2 次，避免无限循环
+
+### 2. 降级路径 `_fallback_split`（无 word timestamps）
+
+当 seg 无 `words` 字段时（独立 CLI 运行），退化为简单比率分割：
+- 按字符数和时长计算目标片数
+- 在常见标点处优先切分（`，、。？！；：`）
+- 按时间比分配各片时间戳
+
+### 3. 全局常量
+
+| 常量 | 默认值 | 说明 |
+|------|--------|------|
+| `_DEFAULT_MIN_LINE_CHARS` | `8` | 最小行字符数（低于此值触发碎片罚分） |
+| `_DEFAULT_MAX_CHARS` | `30` | 默认最大行字符数 |
+| `_DEFAULT_MAX_LINE_MS` | `4000` | 默认最大行时长（ms） |
+| `BAD_LINE_START` | 约 25 词 | 不适宜行首的词（连接词/语气词/助词，如"但是/所以/而且/的/了/吗"） |
+| `BAD_LINE_END` | 约 30 词 | 不适宜行尾的词（助词/介词/连词，如"的/了/在/到/从"） |
+| `GOOD_LINE_START` | 约 15 词 | 适宜行首的词（逻辑连接词，如"首先/其次/最后/但是/所以"） |
+
+`BAD_LINE_START` / `BAD_LINE_END` / `GOOD_LINE_START` 完整列表见 `refine_segments.py` 第 36-66 行。
 
 ## 附录: 清洗算法
 
@@ -513,10 +559,8 @@ AI 处理完成后可清理 `tmp/` 目录。
 以 refine 输出的 segments 为基线，通过 cleanup_segments.py 做最终清洗：
 
 cleanup_segments.py
-  ├── 去空文本段（text.strip() == "" 的 segment 直接删除）
-  └── 合并相邻重复段（相邻 segment 文本一致时，扩展前段的 end 时间，删除后段）
+  ├── 去空文本段（text.strip() == "" 直接删除，与 refine 的 `_clean_segments` 冗余兜底）
+  ├── 幻觉检测（`_is_repeat_loop`：极低字符复现率/超短词汇表的 loop 判定 + 已知幻觉黑名单）
+  └── 合并相邻重复段（VAD 边界重叠或 refine 切分后不区分大小写完全相同的相邻 segment）
 
-后清洗置于 refine 之后，因为 refine 的重复检测（Level 8）会主动将文本切为两份，
-可能导致相邻 segment 内容相同——cleanup 在这一步统一收口合并。
-
-两阶段分工：预清洗处理上游 ASR 的噪声 block，后清洗处理 refine 切分后产生的相邻重复。
+两阶段分工：预清洗处理 ASR 噪声（空/零时长），后清洗处理 VAD 边界重叠和幻觉。

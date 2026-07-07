@@ -2,7 +2,7 @@
 
 本规则是 SKILL.md Step 4 翻译规则的**行业补充指南**。当两者冲突时，以 SKILL.md 规则为准：
 
-- SKILL.md 要求「去标点」→ 翻译时移除标点（本文件中"标点处断行"类描述需在此前提下理解）
+- SKILL.md 要求「去标点」→ 翻译时移除标点（书名号《》例外，保留）；本文件中"标点处断行"类描述需在此前提下理解
 - SKILL.md 要求「每行 ≤18 中文字符」→ 优先保证字数限制
 
 ---
@@ -40,10 +40,7 @@
 ## 二、术语处理（本规则的重点 · 中文优先）
 
 本规则面向中文观众，**优先使用中文译名，英文在该术语首次出现的那一条字幕内括注于后**；后续条目只用中文译名（除非英文更通用，见下）。字幕空间有限，括注从简，避免一条字幕被注释撑爆。
-
-- **专业技术术语：中文译名（英文）。** 例：关键帧（Keyframe）、混合变形（Blend Shape）、蒙皮簇（Skin Cluster）、IK 求解器（IK Solver）、极向量（Pole Vector）、NURBS 曲线（NURBS Curve）、辅助骨骼（helper joints）、绘制权重（painted weights）、影响范围（influence）。首次括注后，全片统一只用中文译名。
 - **软件 / 工具 / 引擎 / 平台名：以中文通用写法为准，无通用中文名则保留英文，绝不音译。** 有通用中文名：虚幻5引擎（Unreal Engine 5, UE5）。业界直接用英文、无通用中文名：Maya、Hypershade、Playblast、PySide6、PureRef、Perforce、Tripo 3D、Claude——保留英文原名（不要写成"玛雅""珀福斯"）。判断标准：中文从业者平时怎么称呼，就怎么写。
-- **比赛 / 赛道 / 机构 / 学校名：保留官方名称，不音译、不意译；首次出现可括注通用中文，空间不足则省略括注。** 例：Rookies（新秀奖）、Concept Art（概念设计）、Paint Over、Digital Fashion、Game Art、Art Center（ACCD）、USC、NYU、CMU、EA、Obsidian Entertainment、Remedy Entertainment、Overwatch（守望先锋）。学校缩写（ACCD/USC/NYU/CMU）保留原文。
 - **大小写与写法以官方为准：** Maya（非 maya）、Keyframe（作赛道名时首字母大写）、PySide6（非 py side 6）、GitHub、Pull Request、Ctrl+V。代码符号、命令、路径、函数名（如 `polyCube`、`mcn.newjoint`、`MSyntax`、`ikRPsolver`）原样保留，不翻译、不加空格、不改大小写。
 - **修正 ASR 误识别的术语：** 字幕源多为语音转写，常见英文术语被听错（如 make→Maya、py side 6→PySide6、key frame→Keyframe、concept art→Concept Art、Owatch→Overwatch、R Center→Art Center）。翻译时应结合上下文识别并按正确术语翻译，不要照搬错误读音。仅在能确认是术语误识别时修正，拿不准则保守保留。
 - **作品 / 影视 / 游戏标题：** 有官方中文译名的用中文并加书名号《》（如《守望先锋》）；无官方译名保留原文。引擎名、工具名、公司名、工作室名**不加**书名号。

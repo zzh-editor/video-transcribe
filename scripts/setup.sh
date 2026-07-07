@@ -14,7 +14,7 @@ fi
 echo "[setup] installing Python dependencies..."
 
 # ── Whisper引擎 ──────────────────────────────────────────────────
-venv/bin/pip install --quiet mlx-whisper socksio soundfile
+venv/bin/pip install --quiet mlx-whisper faster-whisper socksio soundfile
 
 # ── Groq API ────────────────────────────────────────────────────
 venv/bin/pip install --quiet requests
