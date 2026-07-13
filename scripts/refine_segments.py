@@ -216,7 +216,7 @@ def _segment_words(
             if pending_break is not None:
                 pre_chars = _chars(words[start:pending_break])
                 pre_dur = words[pending_break - 1]["end"] - words[start]["start"]
-                if pre_chars >= max_chars // 2 and pre_chars <= max_chars and pre_dur <= max_dur:
+                if pre_chars >= _DEFAULT_MIN_LINE_CHARS and pre_chars <= max_chars and pre_dur <= max_dur:
                     best_end = pending_break
                     break
 
@@ -278,12 +278,52 @@ def _clean_segments(segments: list[dict]) -> list[dict]:
 
 # ── Fallback (for CLI / segments without word timestamps) ───────────
 
+def _find_split(text: str, char_pos: int, target_chars: int,
+                 max_chars: int) -> int:
+    """Find a good split position near char_pos + target_chars."""
+    end = min(char_pos + target_chars, len(text))
+
+    # 1. Try punctuation (strong boundary)
+    for c in range(end, max(char_pos, end - 6), -1):
+        if c > char_pos and text[c] in "，、。？！；：":
+            return c + 1
+
+    # 2. Try space backward (English word boundary)
+    for c in range(end, max(char_pos, end - 15), -1):
+        if c > char_pos and text[c - 1] == " ":
+            return c
+
+    # 3. Try space forward
+    for c in range(end, min(len(text), end + 10)):
+        if text[c] == " ":
+            return c + 1
+
+    # 4. Protect English words — don't split mid-word
+    if end > char_pos and end < len(text) and _is_eng(text[end - 1]) and _is_eng(text[end]):
+        for c in range(end, min(len(text), end + 10)):
+            if not _is_eng(text[c]):
+                return c
+
+    # 5. Bad-line-start check: if candidate starts with BAD_LINE_START, push forward
+    candidate = text[char_pos:end].strip()
+    for w in BAD_LINE_START:
+        if candidate.startswith(w) and (len(w) == len(candidate) or
+                                        not _is_eng(candidate[len(w)])):
+            for c in range(end, min(end + 6, len(text))):
+                if text[c] in "，、。？！；：":
+                    return c + 1
+            break
+
+    return end
+
+
 def _fallback_split(
     seg: dict,
     max_chars: int = _DEFAULT_MAX_CHARS,
     max_line_ms: int = _DEFAULT_MAX_LINE_MS,
 ) -> list[dict]:
-    """Simple punctuation+ratio split for segments without word timestamps."""
+    """Punctuation + English word boundary + bad-line-start aware split
+    for segments without word timestamps."""
     text = seg.get("text", "").strip()
     if not text:
         return []
@@ -309,12 +349,7 @@ def _fallback_split(
         if i == n_pieces - 1:
             piece_text = text[char_pos:].strip()
         else:
-            end_char = min(char_pos + target_chars, len(text))
-            for c in range(end_char, max(char_pos, end_char - 6), -1):
-                c = min(c, len(text) - 1)
-                if c > char_pos and text[c:c+1] in "，、。？！；：":
-                    end_char = c + 1
-                    break
+            end_char = _find_split(text, char_pos, target_chars, max_chars)
             piece_text = text[char_pos:end_char].strip()
             char_pos = end_char
 
@@ -330,12 +365,42 @@ def _fallback_split(
     return result
 
 
+def _is_eng(ch: str) -> bool:
+    return 'a' <= ch <= 'z' or 'A' <= ch <= 'Z'
+
+
+def _merge_fragments(segments: list[dict], max_chars: int) -> list[dict]:
+    """Merge adjacent segments where an English word is broken across them."""
+    if not segments:
+        return []
+    out = [segments[0]]
+    for seg in segments[1:]:
+        prev = out[-1]
+        prev_text = prev.get("text", "").strip()
+        curr_text = seg.get("text", "").strip()
+        if prev_text and curr_text:
+            prev_last = prev_text[-1]
+            curr_first = curr_text[0]
+            if _is_eng(prev_last) and _is_eng(curr_first):
+                combined = prev_text + curr_text
+                if len(combined.replace(" ", "")) <= max_chars:
+                    out[-1] = {
+                        "start": prev["start"],
+                        "end": seg["end"],
+                        "text": combined,
+                    }
+                    continue
+        out.append(seg)
+    return out
+
+
 # ── Main refine pipeline ────────────────────────────────────────────
 
 def refine(
     segments: list[dict],
     max_chars: int = _DEFAULT_MAX_CHARS,
     max_line_ms: int = _DEFAULT_MAX_LINE_MS,
+    pause_threshold: float | None = None,
 ) -> list[dict]:
     """
     Refine ASR segments into well-timed subtitles using scoring-driven
@@ -345,6 +410,8 @@ def refine(
         segments: List of segment dicts with 'start', 'end', 'text', 'words'
         max_chars: Max characters per subtitle line
         max_line_ms: Max duration per subtitle line in milliseconds
+        pause_threshold: Pause threshold in seconds for split detection.
+                         None = auto-detect from language (0.3s zh / 0.5s en).
 
     Returns:
         Refined segment list with accurate per-line timing
@@ -355,21 +422,32 @@ def refine(
     segments = _clean_segments(segments)
     max_dur = max_line_ms / 1000.0
 
+    # Pre-merge: only for segments without word timestamps (Groq path)
+    # to fix English word fragments broken across segments (e.g. "posit"+"ion")
+    has_word_timestamps = any(seg.get("words") for seg in segments)
+    if not has_word_timestamps and len(segments) > 1:
+        segments = _merge_fragments(segments, max_chars * 2)
+
     out: list[dict] = []
     for seg in segments:
         words = seg.get("words")
         if not words:
-            # No word timestamps — fallback for CLI usage
-            out.extend(_fallback_split(seg, max_chars, max_line_ms))
+            # No word timestamps — keep raw segment boundaries (e.g. Groq),
+            # only merge English word fragments broken across segments
+            out.append(seg)
         else:
             words = _clean_words(words)
             if len(words) < 2:
                 out.append(_to_segment(words) if words else seg)
                 continue
             lang = _detect_language(words)
-            pause_th = 0.3 if lang == "zh" else 0.5
+            if pause_threshold is not None:
+                pause_th = pause_threshold
+            else:
+                pause_th = 0.3 if lang == "zh" else 0.5
             out.extend(_segment_words(words, max_chars, max_dur, pause_th))
 
+    out = _merge_fragments(out, max_chars)
     return out
 
 

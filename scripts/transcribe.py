@@ -353,14 +353,19 @@ def main():
         try:
             from refine_segments import refine as refine_segs
             segments = refine_segs(segments, max_chars=args.max_line_length,
-                                   max_line_ms=args.max_line_ms)
+                                   max_line_ms=args.max_line_ms,
+                                   pause_threshold=0.15)
         except ImportError:
             pass
         except Exception:
             print("refine_segments error, skipping", file=sys.stderr)
         try:
             from cleanup_segments import cleanup as cleanup_segs
+            before_c = len(segments)
             segments = cleanup_segs(segments)
+            if len(segments) != before_c:
+                print(f"cleanup_segments: {before_c} → {len(segments)} segments (removed empty/duplicate)",
+                      file=sys.stderr)
         except ImportError:
             pass
         except Exception:
