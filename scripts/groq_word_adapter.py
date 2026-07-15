@@ -8,6 +8,7 @@ existing scoring engine only to abnormal (overlong/overduration) segments.
 """
 
 import unicodedata
+import warnings
 from pathlib import Path
 
 from refine_segments import _segment_words, _fallback_split
@@ -30,7 +31,9 @@ def _get_tokenizer():
     tok = jieba.Tokenizer()
     dict_path = _get_dict_path()
     if dict_path.exists():
-        tok.load_userdict(str(dict_path))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            tok.load_userdict(str(dict_path))
     return tok
 
 

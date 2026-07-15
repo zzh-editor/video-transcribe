@@ -345,20 +345,39 @@ def main():
             print("error: --groq-api-key is required when --engine groq", file=sys.stderr)
             sys.exit(1)
         from groq_transcribe import transcribe_groq
-        segments = transcribe_groq(
+        result = transcribe_groq(
             str(audio_path),
             api_key=args.groq_api_key,
             language=lang,
         )
+        segments = result.get("segments", [])
+        top_words = result.get("words", [])
+        if not segments:
+            print("error: no segments in Groq response", file=sys.stderr)
+            sys.exit(1)
+
+        from refine_segments import _clean_segments, _merge_fragments
+        segments = _clean_segments(segments)
+        if len(segments) > 1:
+            segments = _merge_fragments(segments, args.max_line_length * 2)
+
         try:
-            from refine_segments import refine as refine_segs
-            segments = refine_segs(segments, max_chars=args.max_line_length,
-                                   max_line_ms=args.max_line_ms,
-                                   pause_threshold=0.15)
+            from groq_word_adapter import refine_groq_segments
+            before = len(segments)
+            segments = refine_groq_segments(
+                segments, top_words,
+                max_chars=args.max_line_length,
+                max_line_ms=args.max_line_ms,
+                pause_threshold=0.15,
+            )
+            if len(segments) != before:
+                print(f"groq_word_adapter: {before} → {len(segments)} segments "
+                      f"(jieba+scoring split for abnormal segments)",
+                      file=sys.stderr)
         except ImportError:
             pass
         except Exception:
-            print("refine_segments error, skipping", file=sys.stderr)
+            print("groq_word_adapter error, skipping", file=sys.stderr)
         try:
             from cleanup_segments import cleanup as cleanup_segs
             before_c = len(segments)

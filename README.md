@@ -35,15 +35,18 @@ generate subtitles / generate srt / convert to srt
      ▼
 ① 提取音频 (ffmpeg → 16kHz WAV)
      │
-     ├── 本地模型 ──────────  Groq API ──────
+     ├── 本地模型 ──────────  Groq API ──────────
      │  macOS → mlx-whisper               API 服务端转录
      │  其他 → faster-whisper             超 25MB 自动压缩
-     │  可选 VAD 分片 (长音频)
+     │  可选 VAD 分片 (长音频)             返回顶层 segments + words
      ▼
-② refine_segments.py
+② refine_segments.py / groq_word_adapter.py
      ├── 去空/零时长/重复
-     ├── 本地模型 → 评分引擎按标点/停顿断句
-     └── Groq API  → 合并英文碎片 (保留原始边界)
+     ├── 本地模型 → 评分引擎按 word timestamps 断句
+     └── Groq API  →
+         ├── 正常 segment → 保留原始边界
+         └── 异常 segment → jieba 聚词 + 评分引擎重拆分
+         (缺失 words / 对齐失败 → 标点/比率兜底)
      │
      ▼
 ③ cleanup_segments.py (去重 + 幻觉检测)
@@ -66,7 +69,9 @@ generate subtitles / generate srt / convert to srt
 | VAD 长音频分片 | Silero VAD 自动切割静音段，>10min 默认开启 |
 | ASR 降噪 | logprob_threshold=-1.0 + no_speech_threshold=0.6 |
 | 评分引擎断句 | 基于 word timestamps + pause/标点评分的断句算法（本地模型） |
+| Groq 顶层 words + jieba | Groq 请求字符级顶层 words，仅对超限 segment 用 jieba 聚词+评分重拆分 |
 | Groq 英文碎片合并 | 自动合并 "posit"+"ion" 等跨段英文碎片 |
+| Groq 局部回退 | words 缺失/对齐失败时按 segment 回退，不影响整份字幕 |
 | 幻觉检测 | 重复字符循环过滤，黑名单模式 |
 | 可选润色 | 调用 srt-enhancer 去口癖/纠错/空格 |
 | 可选翻译 | AI 逐段翻译，支持 3 种排版模式 |
@@ -76,7 +81,8 @@ generate subtitles / generate srt / convert to srt
 
 ```
 video-transcribe/
-├── scripts/          # 转写、断句、清洗、安装脚本
+├── scripts/          # 转写、断句、清洗、Groq 适配、安装脚本
+├── data/             # jieba 领域词典
 ├── venv/             # Python 虚拟环境（自动创建）
 ├── models/           # Whisper 模型缓存（约 1.6GB）
 ├── docs/             # 行业翻译规则
@@ -92,6 +98,9 @@ video-transcribe/
 - mlx-whisper（macOS arm64 本地模型）
 - faster-whisper（其他平台本地模型）
 - requests + API Key（Groq API）
+
+**中文分词（Groq 模式）：**
+- jieba 0.42.1 + 领域词典（`data/jieba_domain_dict.txt`）
 
 **本地模型优化（可选，失败自动降级）：**
 - silero-vad-notorch + onnxruntime（macOS 长音频 VAD 预分片）

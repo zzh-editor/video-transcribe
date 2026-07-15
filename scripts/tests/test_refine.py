@@ -129,14 +129,29 @@ class TestRefineSegments(unittest.TestCase):
             {"word": "这个", "start": 1.8, "end": 2.0},
             {"word": "新的", "start": 2.0, "end": 2.3},
             {"word": "功能", "start": 2.3, "end": 2.5},
+            {"word": "首先", "start": 3.0, "end": 3.3},
+            {"word": "我们", "start": 3.3, "end": 3.5},
+            {"word": "先", "start": 3.5, "end": 3.7},
+            {"word": "来", "start": 3.7, "end": 3.9},
+            {"word": "看", "start": 3.9, "end": 4.1},
+            {"word": "一下", "start": 4.1, "end": 4.3},
+            {"word": "这个", "start": 4.3, "end": 4.5},
+            {"word": "界面", "start": 4.5, "end": 4.8},
+            {"word": "然后", "start": 5.2, "end": 5.4},
+            {"word": "我们", "start": 5.4, "end": 5.6},
+            {"word": "再", "start": 5.6, "end": 5.8},
+            {"word": "一步", "start": 5.8, "end": 6.0},
+            {"word": "一步", "start": 6.0, "end": 6.2},
+            {"word": "去", "start": 6.2, "end": 6.4},
+            {"word": "操作", "start": 6.4, "end": 6.7},
         ]
-        text = "大家好今天我们来学习一下这个新的功能"
-        segs = [{"start": 0.0, "end": 2.5, "text": text, "words": words}]
-        result = refine(segs, max_chars=25, max_line_ms=4000)
+        text = "大家好今天我们来学习一下这个新的功能首先我们先来看一下这个界面然后我们再一步一步去操作"
+        segs = [{"start": 0.0, "end": 8.5, "text": text, "words": words}]
+        result = refine(segs, max_chars=20, max_line_ms=4000)
         self.assertEqual(len(result), 3)
         for s in result:
             t = s["text"].replace(" ", "")
-            self.assertLessEqual(len(t), 25)
+            self.assertLessEqual(len(t), 20)
         reconstructed = "".join(s["text"] for s in result).replace(" ", "")
         self.assertEqual(reconstructed, text)
 

@@ -25,8 +25,10 @@ version: 3.0.0
       │   其他平台   → faster-whisper (CPU/CUDA)
       │   每 VAD 片独立转录，时间戳绝对化后拼接
       ▼
-④ refine_segments.py 预清洗 + 评分引擎断句
-      │   _clean_segments 去空/零时长/重复 → word-timestamp 评分引擎（pause/natural break/scored cuts）+ pending_break 回退 + duration 保护
+④ refine_segments.py 预清洗 + 评分引擎断句 / Groq word adapter
+      │   _clean_segments 去空/零时长/重复
+      │   本地 → word-timestamp 评分引擎（pause/natural break/scored cuts）
+      │   Groq  → jieba 聚词 + 评分引擎（仅异常 segment）
       ▼
 ⑤ cleanup_segments.py 后清洗
       │   合并相邻重复（VAD 边界重叠 + 幻觉检测）
@@ -178,7 +180,7 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 
 ### 使用 Groq API (engine=groq)
 
-使用 Groq 云端 `whisper-large-v3`，返回 word timestamps：
+使用 Groq 云端 `whisper-large-v3`，同时请求顶层 segments 和字符级 words：
 
 ```bash
 API_KEY=$(python3 -c "
@@ -196,6 +198,15 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 注意事项：
 - 音频文件不得超过 **25MB**（Groq 免费层限制），超过时提示用户改用本地模型
 - 无需 VAD 分片（API 服务端处理）
+- words 为字符级（中文单字），通过 `groq_word_adapter.py` 用 jieba 聚合为词组后评分
+- 仅超字符数或时长阈值的 segment 被重新断句，正常 segment 保留原始边界
+- 缺失 words、时间无效或覆盖率不足时按 segment 独立回退
+
+脚本特性：
+- 返回 `{segments, words}`；words 为清洗后的顶层字符级，不嵌入 segment
+- 异常检测：`_is_abnormal()` 基于 max_line_length / max_line_ms
+- 对齐 → jieba 聚词 → 英文/技术标识符保护 → 复用 `_segment_words()` 评分
+- 局部回退：缺 words / 对齐失败 / 覆盖率 < 90% → `_fallback_split()` 标点比率兜底
 
 ## Step 3: refine_segments.py 预清洗 + 语义断句优化
 
@@ -203,6 +214,8 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 
 1. `_clean_segments()` — 去空文本/零时长/完全重复（ASR 噪声过滤）
 2. `_segment_words()` — word-timestamp 评分引擎断句（自然停顿/溢出分割 + pending_break 回退）
+
+**Groq 路径**走 `groq_word_adapter.refine_groq_segments()`：取顶层字符级 words，对齐 segment 文本后经 jieba 聚合为词组，仅对超限 segment 复用 `_segment_words()` 评分。本地路径不变。
 
 也可独立调用仅做诊断验证：
 
@@ -421,6 +434,10 @@ fi
 - **faster-whisper**（其他平台本地模型）：`venv/bin/pip install faster-whisper`
 - **requests** + API Key（Groq API）：`venv/bin/pip install requests`
 
+### 中文分词（Groq 模式必需）
+- **jieba==0.42.1**：`venv/bin/pip install jieba==0.42.1`（MIT，约 19 MB，自定义词典支持）
+- 领域词典：`data/jieba_domain_dict.txt`（UTF-8 userdict 格式，每行 `词语 词频 词性`）
+
 ### 本地模型优化（可选，失败自动降级）
 - **silero-vad-notorch**（macOS 长音频 VAD 预分片）：`venv/bin/pip install silero-vad-notorch`
 - **onnxruntime**（VAD 推理引擎）：`venv/bin/pip install onnxruntime`
@@ -470,6 +487,7 @@ AI 处理完成后可清理 `tmp/` 目录。
 | Groq 速率限制 (429) | 提示频率超限，稍后再试 | 建议切换本地模型 |
 | Groq API 连接失败 | 检查网络连接 | 建议切换本地模型 |
 | `requests` 未安装（Groq 模式） | `venv/bin/pip install requests` | 切换本地模型 |
+| `import jieba` 失败（Groq 模式） | `venv/bin/pip install jieba==0.42.1` | Groq adapter 跳过，保留原始 segment |
 | config.json 损坏或格式无效 | 提示检查 JSON 格式，展示预期结构 | 用 Question 询问是否重新执行引擎选择流程 |
 
 ---
@@ -564,3 +582,35 @@ cleanup_segments.py
   └── 合并相邻重复段（VAD 边界重叠或 refine 切分后不区分大小写完全相同的相邻 segment）
 
 两阶段分工：预清洗处理 ASR 噪声（空/零时长），后清洗处理 VAD 边界重叠和幻觉。
+
+## 附录: Groq Word Adapter（顶层字符 words + jieba 聚词）
+
+Groq `whisper-large-v3` 的 `verbose_json` 响应在顶层提供字符级 `words`（中文单字时间戳）。`groq_word_adapter.py` 将其转为词组级 timed units，仅对异常 segment 断句：
+
+### 1. 顶层 word 归属 `_assign_words_to_segments`
+
+每个顶层 word 按最大时间重叠归属到 segment。若多个 segment 有相同重叠长度（跨边界 word），按 word 中点与 segment 中点的距离 tie-break；中点仍相同时优先前 segment。
+
+### 2. 字符时间映射 `_build_char_time_map`
+
+忽略 Unicode 空白和 NFKC 标准化后，将 Groq words 的字符级时间戳按顺序对齐到原文非标点字符。标点时间取前/后最近字符或全段最后时间。
+
+### 3. 覆盖率检查 `_check_coverage`
+
+非标点字符中已有时间映射的比例。≥90% 通过；不足则回退。纯标点段直接 100%。
+
+### 4. jieba 聚词 `_build_phrased_units`
+
+使用独立 `jieba.Tokenizer` 加载 `data/jieba_domain_dict.txt`，精确模式 `tokenize()` 返回原文 offsets，投影到首末字符时间。
+
+### 5. 技术标识符保护 `_protect_technical_tokens`
+
+相邻满足 `_is_ascii_ident`（全 ASCII 字母/数字/`+#-_.&/`）的单元合并为单个 token，防止 `C++`、`NBA 2K`、`Dynamic Hair Pipeline` 被中间拆分。
+
+### 6. 异常检测 `_is_abnormal`
+
+去空白字符数 > `max_chars` 或 duration（ms）> `max_line_ms` 时判定为异常。正常 segment 跳过所有处理，原样输出。
+
+### 7. refine `refine_groq_segments`
+
+对异常且带顶层 words 的 segment：映射 → 覆盖率检查 → jieba 精确分词 → 技术标识符保护 → 传入 `_segment_words()` 评分断句。任一步失败回退 `_fallback_split()`。正常 segment 或无 words segment 保留原始边界。每个 segment 独立验证文字守恒和时间单调。
