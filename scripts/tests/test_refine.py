@@ -115,7 +115,30 @@ class TestRefineSegments(unittest.TestCase):
         text = "今天天气真不错，我们一起去公园散步吧。"
         segs = [{"start": 0.0, "end": 8.0, "text": text, "words": []}]
         result = refine(segs, max_chars=11, max_line_ms=5000)
-        self.assertGreater(len(result), 1)
+        self.assertEqual(len(result), 1)
+
+    def test_local_words_characterization(self):
+        words = [
+            {"word": "大家", "start": 0.0, "end": 0.3},
+            {"word": "好", "start": 0.3, "end": 0.5},
+            {"word": "今天", "start": 0.5, "end": 0.8},
+            {"word": "我们", "start": 0.8, "end": 1.1},
+            {"word": "来", "start": 1.1, "end": 1.3},
+            {"word": "学习", "start": 1.3, "end": 1.6},
+            {"word": "一下", "start": 1.6, "end": 1.8},
+            {"word": "这个", "start": 1.8, "end": 2.0},
+            {"word": "新的", "start": 2.0, "end": 2.3},
+            {"word": "功能", "start": 2.3, "end": 2.5},
+        ]
+        text = "大家好今天我们来学习一下这个新的功能"
+        segs = [{"start": 0.0, "end": 2.5, "text": text, "words": words}]
+        result = refine(segs, max_chars=25, max_line_ms=4000)
+        self.assertEqual(len(result), 3)
+        for s in result:
+            t = s["text"].replace(" ", "")
+            self.assertLessEqual(len(t), 25)
+        reconstructed = "".join(s["text"] for s in result).replace(" ", "")
+        self.assertEqual(reconstructed, text)
 
     def test_bad_line_start_penalty(self):
         self.assertIn("和", BAD_LINE_START)

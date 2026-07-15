@@ -93,12 +93,30 @@ def _compress_audio(audio_path: str, max_size_mb: int = 25) -> str:
     return tmp_mp3
 
 
+def _clean_words(words: list) -> list[dict]:
+    cleaned = []
+    for w in words:
+        text = (w.get("word") or "").strip()
+        start = w.get("start")
+        end = w.get("end")
+        if not text or start is None or end is None:
+            continue
+        try:
+            s, e = float(start), float(end)
+        except (ValueError, TypeError):
+            continue
+        if e <= s:
+            continue
+        cleaned.append({"word": text, "start": s, "end": e})
+    return cleaned
+
+
 def transcribe_groq(
     audio_path: str,
     api_key: str,
     language: str | None = None,
     model: str = "whisper-large-v3",
-) -> list[dict]:
+) -> dict:
     audio_path = str(audio_path)
     file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
     if file_size_mb > MAX_FILE_SIZE_MB:
@@ -118,6 +136,7 @@ def transcribe_groq(
         ("model", model),
         ("response_format", "verbose_json"),
         ("timestamp_granularities[]", "segment"),
+        ("timestamp_granularities[]", "word"),
     ]
     if language:
         data.append(("language", language))
@@ -168,7 +187,12 @@ def transcribe_groq(
             })
 
         segments.sort(key=lambda s: s["start"])
-        return segments
+
+        raw_words = result.get("words", [])
+        words = _clean_words(raw_words)
+        words.sort(key=lambda w: w["start"])
+
+        return {"segments": segments, "words": words}
     finally:
         if upload_path != audio_path and os.path.exists(upload_path):
             os.unlink(upload_path)
