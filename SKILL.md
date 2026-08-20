@@ -438,9 +438,25 @@ fi
 - options:
   - label: "是，删除 tmp/ 目录" → description: "清理中间文件（WAV、原始 SRT、润色临时文件等）"
   - label: "否，保留" → description: "保留 tmp/ 目录供调试参考"
+  - label: "是，先输出竖屏字幕再清理" → description: "对 tmp/final.srt 调用 srt-enhancer 竖屏管线生成 9:16 竖屏字幕，再删除 tmp/ 目录"
 - multiple: false
 
-用户选择「是」则执行 `rm -rf "<output_dir>/tmp"`。
+用户选择「是，删除 tmp/ 目录」则执行 `rm -rf "<output_dir>/tmp"`。
+
+用户选择「是，先输出竖屏字幕再清理」则执行竖屏输出流程，完成后删除 tmp/ 目录。
+
+### Step 7.5: [可选] 输出竖屏字幕
+
+对 `tmp/final.srt` 调用 srt-enhancer 的竖屏管线（见 srt-enhancer「输出竖屏字幕」章节），为 9:16 竖屏视频重断句。竖屏字幕每行 4-12 字、按语义边界断句、时间轴按字数比例重排。
+
+**用 Skill 工具加载 srt-enhancer 技能**，对 `tmp/final.srt` 执行：
+
+1. AI 逐条读取文本，生成语义断句计划（每行 ≤12 字、断在语义边界），写入 `tmp/vertical_splits.json`
+2. 运行 `scripts/vertical.py tmp/final.srt --splits tmp/vertical_splits.json -o "<输入文件目录>/<输入文件名>_<语言>_竖屏.srt"`
+3. 校验输出：断句数增加、每行 ≤12 字、时间轴总跨度不变，并向用户展示 3-5 条断句样例
+4. 删除 `tmp/vertical_splits.json`（临时文件）
+
+输出文件名规则：`<输入文件名>_<语言>_竖屏.srt`（润色与否不影响竖屏命名）。完成后执行 `rm -rf "<output_dir>/tmp"`。
 
 ## 禁止做的事
 
@@ -516,6 +532,7 @@ AI 处理完成后可清理 `tmp/` 目录。
 | 联网校准搜索结果无权威来源 | 跳过该术语修正，标注 ❗ | 保留原文，标记 `#unverified` |
 | srt-enhancer 子步骤被跳过（未执行 domain detection 或 web calibration） | 回退到 Step 4 重新执行完整子步骤清单 | 跳过润色，以 raw.srt 为基线 |
 | AI 翻译执行失败（上下文超限/超时/输出格式异常） | 减小每批翻译量（每次 5 条 SRT 条目）、重试 | 跳过翻译，以未翻译的 final.srt 作为最终输出 |
+| 竖屏输出失败（vertical.py 报错/计划缺失） | 用 vertical.py 的 `--max-chars` 硬切回退 | 跳过竖屏输出，仍清理 tmp/ 并告知用户 |
 | Groq API 文件 >25MB | 提示用户改用本地模型或自行压缩音频 | 用 Question 询问是否切换本地模型 |
 | Groq API Key 无效 (401) | 提示检查 API Key | 用 Question 询问是否重新输入 Key |
 | Groq 网络超时 (600s) | 提示连接超时 | 建议切换本地模型 |
