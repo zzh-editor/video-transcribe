@@ -116,6 +116,7 @@ def transcribe_groq(
     api_key: str,
     language: str | None = None,
     model: str = "whisper-large-v3",
+    prompt: str | None = None,
 ) -> dict:
     audio_path = str(audio_path)
     file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
@@ -140,6 +141,8 @@ def transcribe_groq(
     ]
     if language:
         data.append(("language", language))
+    if prompt:
+        data.append(("prompt", prompt))
 
     try:
         with open(upload_path, "rb") as f:
@@ -180,11 +183,16 @@ def transcribe_groq(
 
         segments = []
         for seg in raw_segments:
-            segments.append({
+            entry = {
                 "start": seg.get("start", 0),
                 "end": seg.get("end", 0),
                 "text": seg.get("text", "").strip(),
-            })
+            }
+            for quality_key in ("no_speech_prob", "avg_logprob",
+                                "compression_ratio"):
+                if quality_key in seg and seg[quality_key] is not None:
+                    entry[quality_key] = seg[quality_key]
+            segments.append(entry)
 
         segments.sort(key=lambda s: s["start"])
 

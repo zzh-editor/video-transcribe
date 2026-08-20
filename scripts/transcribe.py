@@ -285,11 +285,49 @@ def write_srt(segments: list[dict], output_path: str):
             f.write(f"{seg['text']}\n\n")
 
 
+def export_refined_json(segments: list[dict], output_path: str):
+    """Export refined segments (with word timestamps) for LLM re-segmentation.
+
+    Only segments that carry a non-empty 'words' list are emitted, since
+    word-level timestamps are required for precise re-splitting.
+    """
+    import json
+    payload = [
+        {
+            "start": round(seg["start"], 3),
+            "end": round(seg["end"], 3),
+            "text": seg["text"],
+            "words": [
+                {"word": w.get("word", ""), "start": w.get("start"),
+                 "end": w.get("end")}
+                for w in seg.get("words", [])
+                if w.get("word") and w.get("start") is not None
+                and w.get("end") is not None
+            ],
+            **{k: seg[k] for k in ("no_speech_prob", "avg_logprob",
+                                   "compression_ratio") if k in seg},
+        }
+        for seg in segments
+    ]
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+    print(f"exported refined segments (with words) -> {output_path}",
+          file=sys.stderr)
+
+
 # ── Platform detection ─────────────────────────────────────────────
 
 def detect_platform() -> dict:
     return {"is_macos": sys.platform == "darwin",
             "is_arm": platform.machine() == "arm64"}
+
+
+# Groq STT prompt (optional). Guiding spelling can help Whisper transcribe
+# specialised terms, BUT testing showed a Chinese instruction prompt gets
+# re-read aloud as hallucinated speech during silent windows (e.g. "请准确转写
+# 专业术语．保持简体中文。" appearing 23x in one video). Default is NO prompt;
+# pass --prompt only when you've verified it helps for your content.
+DEFAULT_GROQ_PROMPT = None
 
 
 # ── Main ───────────────────────────────────────────────────────────
@@ -307,6 +345,14 @@ def main():
                         help="max duration per subtitle block in ms (default: 6000)")
     parser.add_argument("--pause-ms", type=int, default=None,
                         help="pause threshold for sentence split in ms (default: 300 zh / 500 en)")
+    parser.add_argument("--full-segment", action="store_true", default=False,
+                        help="Groq: run the scoring splitter on EVERY segment "
+                             "(not just abnormal ones); default off — verify before enabling")
+    parser.add_argument("--prompt", default=None, metavar="TEXT",
+                        help="Groq STT prompt (<=224 tokens) guiding spelling/context. "
+                             "Default: none — a Chinese instruction prompt is re-read "
+                             "as hallucinated speech in silent windows; only pass one "
+                             "if you've verified it helps your content.")
     parser.add_argument("--engine", choices=["auto", "mlx", "faster-whisper", "groq"],
                         default="auto", help="force a specific engine")
     parser.add_argument("--groq-api-key", default=None,
@@ -315,6 +361,8 @@ def main():
                         help="enable VAD pre-splitting (Silero VAD for mlx, vad_filter for faster)")
     parser.add_argument("--no-vad", action="store_true", default=None,
                         help="disable VAD pre-splitting")
+    parser.add_argument("--export-refined", default=None, metavar="PATH",
+                        help="export refined segments (with word timestamps) as JSON")
 
     args = parser.parse_args()
 
@@ -349,6 +397,7 @@ def main():
             str(audio_path),
             api_key=args.groq_api_key,
             language=lang,
+            prompt=args.prompt if args.prompt is not None else DEFAULT_GROQ_PROMPT,
         )
         segments = result.get("segments", [])
         top_words = result.get("words", [])
@@ -369,6 +418,7 @@ def main():
                 max_chars=args.max_line_length,
                 max_line_ms=args.max_line_ms,
                 pause_threshold=0.15,
+                full_segment=args.full_segment,
             )
             if len(segments) != before:
                 print(f"groq_word_adapter: {before} → {len(segments)} segments "
@@ -389,6 +439,8 @@ def main():
             pass
         except Exception:
             print("cleanup_segments error, skipping", file=sys.stderr)
+        if args.export_refined:
+            export_refined_json(segments, args.export_refined)
         write_srt(segments, output_path)
         print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
         return output_path
@@ -420,6 +472,8 @@ def main():
         vad=vad_enabled,
     )
 
+    if args.export_refined:
+        export_refined_json(segments, args.export_refined)
     write_srt(segments, output_path)
     print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
     return output_path

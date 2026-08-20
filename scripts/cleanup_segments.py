@@ -23,9 +23,47 @@ from pathlib import Path
 MIN_HALLUCINATION_LEN = 30   # minimum length to check for loops
 MIN_UNIQUE_CHARS_RATIO = 0.04  # unique chars / total length below this = loop
 
+# Known whisper hallucination phrases. Matching is normalized (spaces/zero-width
+# stripped) so Groq's spacing-free output still hits the blacklist.
 KNOWN_HALLUCINATIONS = frozenset({
     "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
+    # Whisper re-reads a Chinese instruction prompt aloud as hallucinated speech
+    # during silent windows. Substrings match any variant of the recurring
+    # phrase ("请准确转写专业术语．保持简体中文。" / "请准确转写专业术" etc).
+    "请准确转写专业",
+    "保持简体中文",
 })
+
+# Text-density hallucination rule: a segment whose text is far too long for
+# its tiny duration is almost always a whisper hallucination (real speech
+# sustains ~4-8 chars/s in Chinese). e.g. 18 chars in 0.54s (~33 chars/s).
+HALLUC_DURATION_S = 1.0       # only flag segments shorter than this
+HALLUC_MIN_CHARS = 15         # ... with at least this many visible chars
+HALLUC_MIN_CHARS_PER_SEC = 15.0  # ... at a density above this threshold
+
+# Groq verbose_json quality-metric hallucination rule. Whisper reports a high
+# no_speech_prob for silence-blocks it hallucinated text into; low avg_logprob
+# additionally flags low-confidence decoding. Together they identify invented
+# content better than any text heuristic (which can be fooled by spacing or
+# short-but-valid loops).
+NO_SPEECH_PROB_THRESHOLD = 0.8   # >= this → decoder believes there's no speech
+AVG_LOGPROB_THRESHOLD = -1.0     # <= this → low decoding confidence
+MIN_HALLUC_TEXT_CHARS = 4        # ignore near-empty segments (handled elsewhere)
+
+
+def _normalize_text(text: str) -> str:
+    return text.replace(" ", "").replace("\u200b", "").lower()
+
+
+def _is_known_hallucination(text: str) -> bool:
+    """Blacklist match, normalized (space-insensitive, case-insensitive)."""
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+    for phrase in KNOWN_HALLUCINATIONS:
+        if _normalize_text(phrase) in norm:
+            return True
+    return False
 
 
 def _is_repeat_loop(text: str) -> bool:
@@ -45,6 +83,46 @@ def _is_repeat_loop(text: str) -> bool:
     return False
 
 
+def _is_dense_hallucination(seg: dict) -> bool:
+    """True when a very short segment carries an implausible amount of text,
+    i.e. text density far exceeds human speech rate."""
+    text = seg.get("text", "").strip()
+    chars = len(_normalize_text(text))
+    if not chars or chars < HALLUC_MIN_CHARS:
+        return False
+    duration = (seg.get("end", 0) or 0) - (seg.get("start", 0) or 0)
+    if duration <= 0 or duration > HALLUC_DURATION_S:
+        return False
+    return chars / duration >= HALLUC_MIN_CHARS_PER_SEC
+
+
+def _has_quality_metrics(seg: dict) -> bool:
+    """True when Groq's verbose_json returned quality metrics for this seg."""
+    return "no_speech_prob" in seg and "avg_logprob" in seg
+
+
+def _is_no_speech_hallucination(seg: dict) -> bool:
+    """Detect hallucinated content via Groq's decoder confidence metrics.
+
+    Whisper fabricates text into silence blocks and marks them with a high
+    no_speech_prob plus a very negative avg_logprob. When both signals agree
+    we drop the segment regardless of what its text looks like — this catches
+    spacing/blacklist-free hallucinations the text heuristics miss.
+    """
+    if not _has_quality_metrics(seg):
+        return False
+    nsp = seg.get("no_speech_prob", 0) or 0
+    if nsp < NO_SPEECH_PROB_THRESHOLD:
+        return False
+    logprob = seg.get("avg_logprob", 0) or 0
+    if logprob > AVG_LOGPROB_THRESHOLD:
+        return False
+    text = seg.get("text", "").strip()
+    if len(_normalize_text(text)) < MIN_HALLUC_TEXT_CHARS:
+        return False
+    return True
+
+
 def cleanup(segments: list[dict]) -> list[dict]:
     if not segments:
         return []
@@ -57,7 +135,11 @@ def cleanup(segments: list[dict]) -> list[dict]:
     # Step 1.5: remove hallucinated segments
     non_empty = [s for s in non_empty
                  if not _is_repeat_loop(s.get("text", ""))
-                 and s["text"].strip() not in KNOWN_HALLUCINATIONS]
+                 and not _is_known_hallucination(s.get("text", ""))
+                 and not _is_dense_hallucination(s)
+                 and not _is_no_speech_hallucination(s)]
+    if not non_empty:
+        return []
 
     # Step 2: merge consecutive segments with identical text (case-insensitive)
     merged: list[dict] = [non_empty[0]]

@@ -171,6 +171,12 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --output "<output_dir>/tmp/raw.srt" \
   --language zh \
   --pause-ms 500
+
+# 导出带 word 时间戳的 segments（启用 L3 语义断句复核时使用，见 Step 3 后检查点）
+venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
+  --output "<output_dir>/tmp/raw.srt" \
+  --language zh \
+  --export-refined "<output_dir>/tmp/refined_segments.json"
 ```
 
 脚本特性：
@@ -239,6 +245,35 @@ venv/bin/python3 scripts/cleanup_segments.py "<output_dir>/tmp/raw.srt"
 ```
 
 输出覆盖 `raw.srt`。
+
+## 🔴 CHECKPOINT 🛑 STOP: 语义断句复核（L3，可选）
+
+refine 的评分引擎是启发式断句。若要达到人工精校的断句质量（在语义小句边界切分，如动宾后/主语后/语义起始词前），需 Agent 用 LLM 复核。此步不写脚本，由 Agent 直接判断。
+
+1. 转写命令需加 `--export-refined "<output_dir>/tmp/refined_segments.json"`（见 Step 2），导出带 word 时间戳的 segments
+2. **用 Question 工具弹窗询问用户：**
+   - header: "语义断句复核"
+   - description: "是否启用 LLM 语义断句复核？耗时增加，但断句质量接近人工精校（每段约 8-18 字、在小句边界切分）"
+   - options:
+     - label: "启用" → description: "Agent 读取 refined_segments.json，用 LLM 判断断点，写回 raw.srt"
+     - label: "跳过" → description: "保留评分引擎断句结果"
+   - multiple: false
+
+启用时执行：
+
+**判定标准** — 仅对以下存疑段复核，正常段跳过：
+- 去空白 ≥16 字符且无任何标点/停顿
+- 时长 >4s
+- 文本含残片迹象（短段拼入相邻段后更像词）
+
+**处理步骤**：
+1. 读 `tmp/refined_segments.json`，筛选存疑段
+2. 用 LLM 判断语义断点：在小句边界切（动宾后/主语后/同位语前/语义起始词如"因为/那/你/这种"之前），每段 8-18 字
+3. 按 words 时间戳精确切分：断点落在某 word 的 `start`，新段从该 word 开始；多段时按序重建 start/end/text
+4. 若某段的 words 缺失或时间戳不全，跳过该段（不臆造时间轴）
+5. 将切分结果写回 `tmp/raw.srt`（重新编号），并告知用户调整前后段数
+
+不满足判定标准或用户选择跳过 → 保持评分引擎结果。
 
 ## 🔴 CHECKPOINT 🛑 STOP: 润色确认
 
@@ -489,6 +524,10 @@ AI 处理完成后可清理 `tmp/` 目录。
 | `requests` 未安装（Groq 模式） | `venv/bin/pip install requests` | 切换本地模型 |
 | `import jieba` 失败（Groq 模式） | `venv/bin/pip install jieba==0.42.1` | Groq adapter 跳过，保留原始 segment |
 | config.json 损坏或格式无效 | 提示检查 JSON 格式，展示预期结构 | 用 Question 询问是否重新执行引擎选择流程 |
+| Groq 中文 prompt 被复述为幻觉（实测：`请准确转写专业术．保持简体中文。` 在全片静音段出现 20+ 处，no_speech_prob/avg_logprob 均正常，无法被质量指标识别） | 默认不传 prompt（`DEFAULT_GROQ_PROMPT=None`），如需传只传英文 prompt（实测英文 prompt 无复述幻觉但也无术语改善）；黑名单锚点 `请准确转写专业`/`保持简体中文` 清除残留 | 术语错识靠润色环节 correction-table 修正，不依赖 prompt |
+| Groq 静音窗口包含短词段（≤3 字符却 4-11s，如 `OK`/`然后`/`对然后`，word 时间戳覆盖整个窗口不可靠） | `_absorb_isolated_crumbs` 将孤立短词吸收进无缝衔接的后段（gap≤0.5s） | 保持原样（文本正确，仅时间轴未精确收缩） |
+| Groq 对同一输入多次调用返回非确定段数（实测 137/163/172/282/269/524 不等） | 属 API 正常行为，重跑结果不同；段数差异大不代表代码 bug | 对比质量用单次结果，不追求段数一致 |
+| Groq 音频压缩质量损失（96-112kbps MP3 丢失高频细节） | 优先用 16kHz mono WAV（≤25MB 时），仍超限再压缩；文档推荐 16kHz mono FLAC 无损压缩优于 MP3 | 接受 MP3 压缩或切换本地模型 |
 
 ---
 
@@ -562,6 +601,14 @@ AI 处理完成后可清理 `tmp/` 目录。
 | `GOOD_LINE_START` | 约 15 词 | 适宜行首的词（逻辑连接词，如"首先/其次/最后/但是/所以"） |
 
 `BAD_LINE_START` / `BAD_LINE_END` / `GOOD_LINE_START` 完整列表见 `refine_segments.py` 第 36-66 行。
+
+### 4. 英文残片合并 `_merge_fragments`
+
+断句后统一执行 `_merge_fragments`，修复被 ASR 拆断的英文单词（如 offer 被拆成 `off`+`er`）：
+
+- **词级修复优先于行长度**：当相邻段前段末字符与后段首字符都是英文字母，且间隙 <300ms（连续语音）时，强制拼接，不再受 `max_chars` 限制（`_MERGE_HARD_LIMIT=60` 字符硬上限兜底）
+- **残片前向并入**：纯英文字母 ≤3 字符、时长 <500ms 的段（如独立 `er` 残片），无法并入前段时，尝试并入后段开头
+- 时间戳取合并两段的起止
 
 ## 附录: 清洗算法
 

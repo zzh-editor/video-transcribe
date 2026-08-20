@@ -65,9 +65,30 @@ GOOD_LINE_START = frozenset({
     "到时候", "有时候", "接下来",
 })
 
+# Words that mark the start of a new semantic clause. Manual refinement
+# (人工精校) frequently breaks lines right BEFORE these words, e.g.
+# "因为大厂的 HR" | "优先是在暑期的实习生里面…" or "你应该成功能拿到" |
+# "你特别喜欢的…". They behave opposite to BAD_LINE_START: once the line
+# is long enough, a break here reads naturally.
+SEMANTIC_START = frozenset({
+    "你", "我", "我们", "你们", "它", "他们", "她们",
+    "这个", "那个", "这种", "那种", "这样", "那样",
+    "因为", "所以", "但是", "不过", "那", "那么", "然后",
+    "其实", "最终", "最后", "首先", "就是", "可能", "应该",
+    "如果说", "那我们", "所以说",
+})
+
 _DEFAULT_MAX_CHARS = 25
 _DEFAULT_MAX_LINE_MS = 4000
 _DEFAULT_MIN_LINE_CHARS = 8
+_PREFERRED_MAX_CHARS = 15  # scoring preference, not a hard limit (manual ~12 chars)
+_SEMANTIC_MIN_CHARS = 12   # line length before a SEMANTIC_START break is rewarded
+
+# Left-side characters that make a following SEMANTIC_START word an
+# attributive marker rather than a new clause. "…的[这个]" / "…着[我]"
+# are determiner/prepositional structures (游戏美术的这个经验), NOT clause
+# boundaries; the manual gold keeps them on one line.
+_SEMANTIC_START_BLOCKED_PREFIX = frozenset("的得地着了过")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -142,12 +163,27 @@ def _score_gap(
     elif gap >= pause_threshold * 0.5:
         score += 1.0
 
-    # 3. Length driver — line getting long, encourage a break
+    # 3. Length driver — line getting long, encourage a break.
+    #    A soft preferred-length signal below the hard max: once a line
+    #    passes ~15 chars, nudge toward a break (manual subtitles run ~12).
     if line_dur > max_dur or line_chars > max_chars:
         score += 2.0
+    elif line_chars >= _PREFERRED_MAX_CHARS:
+        score += 1.0
 
-    # 4. Right-side word is bad at line start → penalty
-    if right_word in BAD_LINE_START:
+    # 4. Right-side word at line start.
+    #    SEMANTIC_START words behave opposite to BAD_LINE_START: when the
+    #    line is long enough, breaking right before them reads naturally
+    #    (人工精校 breaks before 因为/那/你/这种 etc.). On short lines the
+    #    break is still discouraged to avoid staccato fragments.
+    left_tail = left_word[-1:] if left_word else ""
+    if (right_word in SEMANTIC_START
+            and left_tail not in _SEMANTIC_START_BLOCKED_PREFIX):
+        if line_chars >= _SEMANTIC_MIN_CHARS:
+            score += 3.0
+        else:
+            score -= 2.0
+    elif right_word in BAD_LINE_START:
         score -= 4.0
     #    Right-side word is good at line start → bonus
     elif right_word in GOOD_LINE_START:
@@ -187,13 +223,24 @@ def _segment_words(
 
     n = len(words)
 
-    # Phase 1: pre-compute natural break positions
-    natural_breaks: set[int] = set()
+    # Phase 1: pre-compute natural break positions.
+    #   strong_breaks — punctuation or pause: fire as soon as the line is
+    #                   substantial (>= _DEFAULT_MIN_LINE_CHARS).
+    #   semantic_breaks — before a new clause starter (因为/那/你/这种…):
+    #                   fire only once the line is long enough
+    #                   (>= _SEMANTIC_MIN_CHARS), matching 人工精校 which
+    #                   breaks before these words on fairly long lines.
+    strong_breaks: set[int] = set()
+    semantic_breaks: set[int] = set()
     for i in range(1, n):
         gap = words[i]["start"] - words[i - 1]["end"]
         left_char = words[i - 1]["word"].strip()[-1:] if words[i - 1]["word"].strip() else ""
+        right_word = words[i]["word"].strip().lower()
         if (left_char and left_char[0] in STRONG_PUNCT) or gap >= pause_threshold:
-            natural_breaks.add(i)
+            strong_breaks.add(i)
+        elif (right_word in SEMANTIC_START
+                and left_char not in _SEMANTIC_START_BLOCKED_PREFIX):
+            semantic_breaks.add(i)
 
     lines: list[dict] = []
     start = 0
@@ -201,22 +248,37 @@ def _segment_words(
     while start < n:
         best_score = -999.0
         best_end = start + 1
-        pending_break = None  # natural break too early; wait for line to grow
+        pending_break = None      # earliest strong break; wait for line to grow
+        pending_semantic = None   # earliest semantic break; needs longer line
 
         for end in range(start + 1, n + 1):
             chunk = words[start:end]
             chunk_chars = _chars(chunk)
             chunk_dur = chunk[-1]["end"] - chunk[0]["start"]
 
-            # Record first natural break position regardless of line size
-            if end in natural_breaks and pending_break is None:
+            # Record first strong break; semantic breaks update to the most
+            # recent one so a too-early semantic point (line still short)
+            # can be superseded by a later, now-long-enough candidate.
+            if end in strong_breaks and pending_break is None:
                 pending_break = end
+            if end in semantic_breaks:
+                pending_semantic = end
 
-            # Use pending break when line is substantial and within limits
+            # Semantic break fires once the line is long enough
+            if pending_semantic is not None:
+                pre_chars = _chars(words[start:pending_semantic])
+                pre_dur = words[pending_semantic - 1]["end"] - words[start]["start"]
+                if (_SEMANTIC_MIN_CHARS <= pre_chars <= max_chars
+                        and pre_dur <= max_dur):
+                    best_end = pending_semantic
+                    break
+
+            # Strong break fires once the line is substantial
             if pending_break is not None:
                 pre_chars = _chars(words[start:pending_break])
                 pre_dur = words[pending_break - 1]["end"] - words[start]["start"]
-                if pre_chars >= _DEFAULT_MIN_LINE_CHARS and pre_chars <= max_chars and pre_dur <= max_dur:
+                if (pre_chars >= _DEFAULT_MIN_LINE_CHARS
+                        and pre_chars <= max_chars and pre_dur <= max_dur):
                     best_end = pending_break
                     break
 
@@ -242,8 +304,11 @@ def _segment_words(
                     best_end = cut
 
             # If overflow has a scored candidate, use it
-            if best_score <= -999.0 and pending_break is not None:
-                best_end = pending_break
+            if best_score <= -999.0:
+                if pending_semantic is not None:
+                    best_end = pending_semantic
+                elif pending_break is not None:
+                    best_end = pending_break
             break
 
         # Safety: always advance at least one word
@@ -369,28 +434,144 @@ def _is_eng(ch: str) -> bool:
     return 'a' <= ch <= 'z' or 'A' <= ch <= 'Z'
 
 
+def _is_cn_char(ch: str) -> bool:
+    return '\u4e00' <= ch <= '\u9fff'
+
+
+_MERGE_HARD_LIMIT = 60   # merged length cap; word repair wins over max_chars
+_FRAGMENT_MAX_CHARS = 3  # remnant like "er" from "offer" is at most 3 letters
+_FRAGMENT_MAX_DUR_S = 0.5  # remnants are very short audio fragments
+_MERGE_GAP_S = 0.3       # near-continuous speech: gap below this = same word
+
+# Single-char function words that attach naturally to a verb/noun ending.
+# Treating them as word-tail remnants avoids false jieba rejections for
+# real cases like "比较艰难" + "的" → "比较艰难的".
+_CN_FUNCTION_WORDS = frozenset("的得地了着过吧吗呢啊呀哦")
+
+
+def _is_eng_fragment(seg: dict) -> bool:
+    """True if the segment is a short pure-ASCII English remnant
+    (e.g. "er" split off from "offer")."""
+    text = seg.get("text", "").strip()
+    if not text or len(text) > _FRAGMENT_MAX_CHARS:
+        return False
+    if not all(_is_eng(c) for c in text):
+        return False
+    dur = seg.get("end", 0) - seg.get("start", 0)
+    return dur < _FRAGMENT_MAX_DUR_S
+
+
+def _is_cn_fragment(seg: dict) -> bool:
+    """True if the segment is a short pure-Chinese remnant
+    (e.g. "集" split off from "作品集", or "西" from "东西")."""
+    text = seg.get("text", "").strip()
+    if not text or len(text) > _FRAGMENT_MAX_CHARS:
+        return False
+    if not all(_is_cn_char(c) for c in text):
+        return False
+    dur = seg.get("end", 0) - seg.get("start", 0)
+    return dur < _FRAGMENT_MAX_DUR_S
+
+
+def _cn_fragment_fits(prev_text: str, frag_text: str) -> bool:
+    """Check whether appending a Chinese remnant to the previous segment's
+    tail forms a natural word/attachment. Uses jieba when available;
+    without jieba, falls back to accepting the merge."""
+    if not prev_text:
+        return False
+    if not _is_cn_char(prev_text[-1]):
+        return False
+    # Function-word remnant (的/了/吧…) — attaches to a verb/noun ending.
+    # Reject stacking on an existing 的 to avoid "的的".
+    if len(frag_text) == 1 and frag_text in _CN_FUNCTION_WORDS:
+        return prev_text[-1] != frag_text
+    try:
+        import jieba
+    except ImportError:
+        return True
+    probe = prev_text[-3:] + frag_text
+    tokens = jieba.lcut(probe)
+    last = tokens[-1] if tokens else ""
+    return last.endswith(frag_text) and len(last) > len(frag_text)
+
+
+def _gap_s(prev: dict, seg: dict) -> float:
+    return seg.get("start", 0) - prev.get("end", 0)
+
+
 def _merge_fragments(segments: list[dict], max_chars: int) -> list[dict]:
-    """Merge adjacent segments where an English word is broken across them."""
+    """Merge adjacent segments where an English word is broken across them.
+
+    Two patterns:
+      1. Broken word: previous segment ends with a letter and the current
+         segment starts with a letter, with near-continuous speech between
+         them. Word integrity wins over max_chars (capped by _MERGE_HARD_LIMIT).
+      2. English remnant (e.g. "er" from "offer"): a very short ASCII-letter
+         segment that can't attach to the previous text gets attached to the
+         next segment when that segment starts with a letter.
+    """
     if not segments:
         return []
-    out = [segments[0]]
-    for seg in segments[1:]:
+    out: list[dict] = []
+    i = 0
+    n = len(segments)
+    while i < n:
+        seg = segments[i]
+        if not out:
+            out.append(seg)
+            i += 1
+            continue
         prev = out[-1]
         prev_text = prev.get("text", "").strip()
         curr_text = seg.get("text", "").strip()
-        if prev_text and curr_text:
-            prev_last = prev_text[-1]
-            curr_first = curr_text[0]
-            if _is_eng(prev_last) and _is_eng(curr_first):
-                combined = prev_text + curr_text
-                if len(combined.replace(" ", "")) <= max_chars:
-                    out[-1] = {
-                        "start": prev["start"],
-                        "end": seg["end"],
+
+        # Pattern 1: broken English word across the segment boundary
+        if (prev_text and curr_text
+                and _is_eng(prev_text[-1]) and _is_eng(curr_text[0])
+                and _gap_s(prev, seg) < _MERGE_GAP_S):
+            combined = prev_text + curr_text
+            if len(combined.replace(" ", "")) <= _MERGE_HARD_LIMIT:
+                out[-1] = {
+                    "start": prev["start"],
+                    "end": seg["end"],
+                    "text": combined,
+                }
+                i += 1
+                continue
+
+        # Pattern 2: English remnant attaches forward to the next segment
+        if (_is_eng_fragment(seg) and i + 1 < n
+                and _gap_s(seg, segments[i + 1]) < _MERGE_GAP_S):
+            nxt = segments[i + 1]
+            nxt_text = nxt.get("text", "").strip()
+            if nxt_text and _is_eng(nxt_text[0]):
+                combined = curr_text + nxt_text
+                if len(combined.replace(" ", "")) <= _MERGE_HARD_LIMIT:
+                    out.append({
+                        "start": seg["start"],
+                        "end": nxt["end"],
                         "text": combined,
-                    }
+                    })
+                    i += 2
                     continue
+
+        # Pattern 3: Chinese remnant attaches backward to the previous
+        # segment ("作品"+"集" → "作品集", "东"+"西" → "东西")
+        if (_is_cn_fragment(seg)
+                and _gap_s(prev, seg) < _MERGE_GAP_S
+                and _cn_fragment_fits(prev_text, curr_text)):
+            combined = prev_text + curr_text
+            if len(combined.replace(" ", "")) <= _MERGE_HARD_LIMIT:
+                out[-1] = {
+                    "start": prev["start"],
+                    "end": seg["end"],
+                    "text": combined,
+                }
+                i += 1
+                continue
+
         out.append(seg)
+        i += 1
     return out
 
 

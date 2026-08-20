@@ -14,6 +14,9 @@ from groq_word_adapter import (
     _is_abnormal,
     _verify_text,
     _verify_times,
+    _speech_span,
+    _shrink_silent_tail,
+    _merge_fragments_groq,
     refine_groq_segments,
 )
 
@@ -278,6 +281,285 @@ class TestRefineGroqSegments(unittest.TestCase):
             max_chars=20, max_line_ms=4000,
         )
         self.assertEqual(len(result), 1)
+
+
+class TestSilentTailShrink(unittest.TestCase):
+
+    def test_span_computation(self):
+        words = [_ws("对", 0.0, 0.3), _ws("然后", 0.3, 0.6), _ws("里", 0.6, 0.9)]
+        self.assertAlmostEqual(_speech_span(words), 0.9)
+
+    def test_short_span_no_shrink(self):
+        # 3 words covering 0.9s inside a 1.0s window → ratio > 0.4, no shrink
+        seg = {"start": 0.0, "end": 1.0, "text": "对然后里"}
+        words = [_ws("对", 0.0, 0.3), _ws("然后", 0.3, 0.6), _ws("里", 0.6, 0.9)]
+        out = _shrink_silent_tail(seg, words)
+        self.assertAlmostEqual(out["end"], 1.0)
+
+    def test_silence_bloated_window_is_shrunk(self):
+        # 3 words spanning 0.9s inside a 6.0s window → heavily padded
+        seg = {"start": 0.0, "end": 6.0, "text": "对然后里"}
+        words = [_ws("对", 0.0, 0.3), _ws("然后", 0.3, 0.6), _ws("里", 0.6, 0.9)]
+        out = _shrink_silent_tail(seg, words)
+        self.assertLess(out["end"], 1.2)
+
+    def test_no_words_returns_original(self):
+        seg = {"start": 0.0, "end": 6.0, "text": "对然后里"}
+        out = _shrink_silent_tail(seg, [])
+        self.assertIs(out, seg)
+
+    def test_last_word_at_end_no_shrink(self):
+        # last word ends at window end → saved < 1s, no shrink
+        seg = {"start": 0.0, "end": 5.5, "text": "对然后里"}
+        words = [_ws("对", 0.0, 0.3), _ws("然后", 0.3, 0.6), _ws("里", 5.0, 5.5)]
+        out = _shrink_silent_tail(seg, words)
+        self.assertAlmostEqual(out["end"], 5.5)
+
+
+class TestMergeFragmentsGroq(unittest.TestCase):
+
+    def test_merges_adjacent_crumbs(self):
+        segs = [
+            {"start": 0.0, "end": 5.0, "text": "对然后里"},
+            {"start": 5.2, "end": 10.0, "text": "面就是可"},
+            {"start": 10.2, "end": 15.0, "text": "以去调整"},
+        ]
+        out = _merge_fragments_groq(segs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "对然后里面就是可以去调整")
+        self.assertAlmostEqual(out[0]["start"], 0.0)
+        self.assertAlmostEqual(out[0]["end"], 15.0)
+
+    def test_large_gap_breaks_merge(self):
+        segs = [
+            {"start": 0.0, "end": 5.0, "text": "对然后里"},
+            {"start": 20.0, "end": 25.0, "text": "面就是可"},
+        ]
+        out = _merge_fragments_groq(segs)
+        self.assertEqual(len(out), 2)
+
+    def test_long_segment_blocks_merge(self):
+        segs = [
+            {"start": 0.0, "end": 5.0, "text": "对然后里"},
+            {"start": 5.2, "end": 10.0, "text": "面就是可以去调整一下这个法线的速度"},
+        ]
+        out = _merge_fragments_groq(segs)
+        self.assertEqual(len(out), 2)
+
+    def test_single_segment_unchanged(self):
+        segs = [{"start": 0.0, "end": 5.0, "text": "对然后里"}]
+        out = _merge_fragments_groq(segs)
+        self.assertEqual(len(out), 1)
+
+    def test_single_fragment_with_long_neighbor_stays(self):
+        # One crumb followed by a long segment → no merge, crumb kept alone
+        segs = [
+            {"start": 0.0, "end": 5.0, "text": "对然后里"},
+            {"start": 5.2, "end": 10.0, "text": "这是一个很长很长的正常句子"},
+        ]
+        out = _merge_fragments_groq(segs)
+        self.assertEqual(len(out), 2)
+
+
+class TestFullSegmentMode(unittest.TestCase):
+
+    def setUp(self):
+        self.fixture = _load_fixture("groq_zh_verbose.json")
+
+    def test_full_segment_splits_normal_short_window(self):
+        # seg[0]: 19 chars in a 2.5s window → not abnormal (chars < 25, dur < 4000),
+        # but with full_segment the scoring engine re-splits it into >= 2 lines.
+        segments = [self.fixture["segments"][0]]
+        words = [w for w in self.fixture["words"] if w["start"] >= 0.0 and w["end"] <= 2.5]
+        result = refine_groq_segments(
+            segments, words,
+            max_chars=10, max_line_ms=4000, pause_threshold=0.3,
+            full_segment=True,
+        )
+        self.assertGreaterEqual(len(result), 2)
+
+    def test_normal_mode_keeps_short_window_whole(self):
+        # With default max_chars=25, seg[0] (19 chars) is not abnormal and
+        # is kept as a single segment in normal (non-full) mode.
+        segments = [self.fixture["segments"][0]]
+        words = [w for w in self.fixture["words"] if w["start"] >= 0.0 and w["end"] <= 2.5]
+        result = refine_groq_segments(
+            segments, words,
+            max_chars=25, max_line_ms=4000, pause_threshold=0.3,
+        )
+        self.assertEqual(len(result), 1)
+
+    def test_full_segment_preserves_text_conservation(self):
+        words = self.fixture["words"]
+        result = refine_groq_segments(
+            self.fixture["segments"], words,
+            max_chars=15, max_line_ms=4000, pause_threshold=0.3,
+            full_segment=True,
+        )
+        merged_text = "".join(r["text"] for r in result)
+        orig_text = "".join(s["text"] for s in self.fixture["segments"])
+        self.assertEqual(
+            merged_text.replace(" ", ""),
+            orig_text.replace(" ", ""),
+        )
+
+
+class TestHallucinationFiltering(unittest.TestCase):
+
+    def test_dense_hallucination_flagged(self):
+        from cleanup_segments import _is_dense_hallucination, cleanup
+        seg = {"start": 0.0, "end": 0.54, "text": "请不吝点赞订阅转发打赏支持明镜与点点栏目"}
+        self.assertTrue(_is_dense_hallucination(seg))
+        out = cleanup([seg])
+        self.assertEqual(len(out), 0)
+
+    def test_dense_hallucination_whitespace_variant(self):
+        from cleanup_segments import _is_dense_hallucination
+        seg = {"start": 0.0, "end": 0.54, "text": "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目"}
+        self.assertTrue(_is_dense_hallucination(seg))
+
+    def test_normal_speech_not_flagged_dense(self):
+        from cleanup_segments import _is_dense_hallucination
+        seg = {"start": 0.0, "end": 2.0, "text": "今天我们一起来做一个风格化水材质"}
+        self.assertFalse(_is_dense_hallucination(seg))
+
+    def test_short_text_no_flag(self):
+        from cleanup_segments import _is_dense_hallucination
+        seg = {"start": 0.0, "end": 0.5, "text": "你好"}
+        self.assertFalse(_is_dense_hallucination(seg))
+
+    def test_long_duration_no_flag(self):
+        from cleanup_segments import _is_dense_hallucination
+        seg = {"start": 0.0, "end": 2.0, "text": "请不吝点赞订阅转发打赏支持明镜与点点栏目"}
+        self.assertFalse(_is_dense_hallucination(seg))
+
+    def test_no_speech_hallucination_flagged(self):
+        from cleanup_segments import _is_no_speech_hallucination, cleanup
+        seg = {"start": 0.0, "end": 1.0, "text": "请不吝点赞订阅转发打赏",
+               "no_speech_prob": 0.95, "avg_logprob": -2.3}
+        self.assertTrue(_is_no_speech_hallucination(seg))
+        self.assertEqual(len(cleanup([seg])), 0)
+
+    def test_no_speech_high_prob_only_not_flagged(self):
+        from cleanup_segments import _is_no_speech_hallucination
+        seg = {"start": 0.0, "end": 1.0, "text": "请不吝点赞订阅转发打赏",
+               "no_speech_prob": 0.95}
+        self.assertFalse(_is_no_speech_hallucination(seg))
+
+    def test_no_speech_low_logprob_only_not_flagged(self):
+        from cleanup_segments import _is_no_speech_hallucination
+        seg = {"start": 0.0, "end": 1.0, "text": "请不吝点赞订阅转发打赏",
+               "avg_logprob": -3.0}
+        self.assertFalse(_is_no_speech_hallucination(seg))
+
+    def test_real_speech_not_flagged(self):
+        from cleanup_segments import _is_no_speech_hallucination
+        seg = {"start": 0.0, "end": 2.0, "text": "今天我们一起来做一个风格化水材质",
+               "no_speech_prob": 0.02, "avg_logprob": -0.15}
+        self.assertFalse(_is_no_speech_hallucination(seg))
+
+    def test_short_text_no_speech_not_flagged(self):
+        from cleanup_segments import _is_no_speech_hallucination
+        seg = {"start": 0.0, "end": 1.0, "text": "对",
+               "no_speech_prob": 0.98, "avg_logprob": -2.0}
+        self.assertFalse(_is_no_speech_hallucination(seg))
+
+    def test_no_speech_without_metrics_skipped(self):
+        from cleanup_segments import _is_no_speech_hallucination
+        seg = {"start": 0.0, "end": 1.0, "text": "请不吝点赞订阅转发打赏"}
+        self.assertFalse(_is_no_speech_hallucination(seg))
+
+    def test_prompt_hallucination_removed(self):
+        from cleanup_segments import _is_known_hallucination, cleanup
+        text = "请准确转写专业术语．保持简体中文。"
+        self.assertTrue(_is_known_hallucination(text))
+        seg = {"start": 389.9, "end": 394.8, "text": text,
+               "no_speech_prob": 0.02, "avg_logprob": -0.21}
+        self.assertEqual(len(cleanup([seg])), 0)
+
+    def test_prompt_hallucination_partial_text_removed(self):
+        from cleanup_segments import _is_known_hallucination
+        self.assertTrue(_is_known_hallucination("请准确转写专业术"))
+        self.assertTrue(_is_known_hallucination("保持简体中文。"))
+        self.assertFalse(_is_known_hallucination("保持中文简体：意思是保持"))
+
+    def test_prompt_hallucination_embedded_in_real_text_removed(self):
+        from cleanup_segments import _is_known_hallucination
+        self.assertTrue(_is_known_hallucination("请准确转写专业术语，然后开始讲解"))
+
+    def test_mixed_prompt_and_real_text_removed(self):
+        from cleanup_segments import cleanup
+        seg = {"start": 760.12, "end": 791.82,
+               "text": "Out。请准确转写专业术．保持简体中文。",
+               "no_speech_prob": 0.05, "avg_logprob": -0.41}
+        self.assertEqual(len(cleanup([seg])), 0)
+
+
+class TestAbsorbIsolatedCrumbs(unittest.TestCase):
+    def _seg(self, text, start, end, words=None):
+        s = {"start": start, "end": end, "text": text}
+        if words is not None:
+            s["words"] = words
+        return s
+
+    def test_absorb_cjk_filler_into_next(self):
+        from groq_word_adapter import _absorb_isolated_crumbs
+        segs = [
+            self._seg("然后", 965.29, 972.27),
+            self._seg("我们这边需要增加一个新的一个节点", 972.27, 975.91),
+        ]
+        out = _absorb_isolated_crumbs(segs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "然后我们这边需要增加一个新的一个节点")
+        self.assertEqual(out[0]["start"], 972.27)
+        self.assertEqual(out[0]["end"], 975.91)
+
+    def test_absorb_english_ok_into_next(self):
+        from groq_word_adapter import _absorb_isolated_crumbs
+        segs = [
+            self._seg("OK", 555.51, 559.96),
+            self._seg("那我们继续做下去", 559.716, 561.336),
+        ]
+        out = _absorb_isolated_crumbs(segs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "OK 那我们继续做下去")
+
+    def test_isolated_kept_when_next_gap_large(self):
+        from groq_word_adapter import _absorb_isolated_crumbs
+        segs = [
+            self._seg("对然后", 1008.51, 1017.45),
+            self._seg("我们可以用到叫做cloudspeed", 1020.00, 1022.00),
+        ]
+        out = _absorb_isolated_crumbs(segs)
+        self.assertEqual(len(out), 2)
+
+    def test_short_duration_kept(self):
+        from groq_word_adapter import _absorb_isolated_crumbs
+        segs = [
+            self._seg("然后", 965.29, 966.98),
+            self._seg("我们这边需要增加一个新的一个节点", 967.27, 970.91),
+        ]
+        out = _absorb_isolated_crumbs(segs)
+        self.assertEqual(len(out), 2)
+
+    def test_normal_segment_kept(self):
+        from groq_word_adapter import _absorb_isolated_crumbs
+        segs = [
+            self._seg("然后我们这边需要增加一个新的一个节点", 965.29, 975.91),
+            self._seg("接下来", 975.91, 977.5),
+        ]
+        out = _absorb_isolated_crumbs(segs)
+        self.assertEqual(len(out), 2)
+
+    def test_no_words_still_absorbed(self):
+        from groq_word_adapter import _absorb_isolated_crumbs
+        segs = [
+            self._seg("对", 1008.51, 1012.0),
+            self._seg("然后我们可以用到叫做cloudspeed", 1012.0, 1019.0),
+        ]
+        out = _absorb_isolated_crumbs(segs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "对然后我们可以用到叫做cloudspeed")
 
 
 if __name__ == "__main__":
