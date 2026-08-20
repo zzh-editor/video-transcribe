@@ -75,6 +75,7 @@ generate subtitles / generate srt / convert to srt
 | 幻觉检测 | 重复字符循环过滤，黑名单模式 |
 | 可选润色 | 调用 srt-enhancer 去口癖/纠错/空格 |
 | 可选翻译 | AI 逐段翻译，支持 3 种排版模式 |
+| 竖屏字幕输出 | 清理临时文件前可选调用 srt-enhancer 竖屏管线，输出 9:16 竖版断句字幕（每行 4-12 字、按语义边界断句、时间轴按字数比例重排） |
 | 配置持久化 | 引擎选择、API Key 首次运行保存至 config.json |
 
 ## 文件结构
