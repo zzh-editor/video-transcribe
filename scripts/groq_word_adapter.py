@@ -21,14 +21,30 @@ _PUNCT = frozenset("，、。？！；：,.;:!?…\u201c\u201d\u2018\u2019\u300c
                    "\u300a\u300b\u3008\u3009\uff08\uff09\uff3b\uff3d"
                    "\u3010\u3011\u300c\u300d" + "\u201c\u201d''\u300e\u300f()[]\u300a\u300b")
 
-# ── Silent-tail shrinkage ────────────────────────────────────────────
+# ── Silent-tail/head shrinkage ───────────────────────────────────────
 # Groq wraps long silence INTO segments (5s window holding 2-4 chars).
-# We shrink a segment's end back to its last word when trailing silence
-# dominates the window.
+# We shrink a segment's end/start back to its first/last word when silence
+# dominates the window. Both edges are trimmed — the original tail-only
+# shrink left leading silence bloat (e.g. a 13s segment starting 1.8s before
+# speech).
 
-_SILENT_PAD_S = 0.2            # keep a small tail after the last word
-_MIN_SILENT_SHRINK_S = 1.0     # only shrink when we save >= 1s
+_SILENT_PAD_S = 0.2            # keep a small pad beyond speech
+_MIN_SILENT_SHRINK_S = 0.8     # only shrink when we save >= 0.8s
 _SILENT_RATIO_THRESHOLD = 0.4  # speech span / segment duration below this = bloated
+
+# ── Silence-triggered split ────────────────────────────────────────────
+# Normal (non-abnormal) segments were previously kept as-is even when they
+# internally span 2-16s of silence (19 cases in W6单元2, e.g. #87 2.3s,
+# #167 5.9s, #394 6.9s). Those wrap two independent utterances into one
+# double-length subtitle. If the largest internal word gap exceeds this
+# threshold we force a scoring split even for otherwise-normal segments.
+_SILENCE_SPLIT_GAP_S = 0.80   # word gap > this inside a normal segment → split
+
+# ── Overlap repair ─────────────────────────────────────────────────────
+# 4 overlapping segments were observed in Enhance output (279-500ms). Groq
+# windows overlap; post-processing can leave start < prev_end. A final
+# de-overlap trims prev end at cur start.
+_OVERLAP_EPS_S = 0.02  # keep 20ms gap after trim
 
 # ── Short-fragment merging ───────────────────────────────────────────
 _FRAGMENT_CHAR_LIMIT = 5       # candidate crumb segment: <= 5 visible chars
@@ -300,6 +316,72 @@ def _speech_span(seg_words: list[dict]) -> float:
     return seg_words[-1]["end"] - seg_words[0]["start"]
 
 
+def _max_internal_gap(seg_words: list[dict]) -> float:
+    """Largest gap between consecutive words inside a segment."""
+    if len(seg_words) < 2:
+        return 0.0
+    return max(
+        seg_words[i]["start"] - seg_words[i - 1]["end"]
+        for i in range(1, len(seg_words))
+    )
+
+
+def _has_large_pause(seg_words: list[dict], threshold: float = _SILENCE_SPLIT_GAP_S) -> bool:
+    return _max_internal_gap(seg_words) > threshold
+
+
+def _shrink_silent_edges(seg: dict, seg_words: list[dict]) -> dict:
+    """Shrink both leading and trailing silence. Returns original when not bloated."""
+    if not seg_words:
+        return seg
+    seg_start = seg.get("start", 0)
+    seg_end = seg.get("end", 0)
+    seg_dur = seg_end - seg_start
+    if seg_dur <= 0:
+        return seg
+    first_start = seg_words[0]["start"]
+    last_end = seg_words[-1]["end"]
+    # Clamp word times inside window
+    if first_start < seg_start:
+        first_start = seg_start
+    if last_end > seg_end:
+        last_end = seg_end
+    span = last_end - first_start if len(seg_words) >= 2 else seg_dur
+    # Not bloated → keep as-is (speech fills the window)
+    if seg_dur > 0 and span / seg_dur > _SILENT_RATIO_THRESHOLD:
+        return seg
+    out = dict(seg)
+    # Leading shrink
+    leading_saved = first_start - seg_start
+    if leading_saved >= _MIN_SILENT_SHRINK_S and first_start > seg_start:
+        out["start"] = max(seg_start, first_start - _SILENT_PAD_S)
+    # Trailing shrink
+    trailing_saved = seg_end - last_end
+    if trailing_saved >= _MIN_SILENT_SHRINK_S and last_end < seg_end:
+        out["end"] = last_end + _SILENT_PAD_S
+    # Guard against inversion
+    if out["end"] <= out["start"]:
+        return seg
+    return out
+
+
+def _deoverlap(segments: list[dict]) -> list[dict]:
+    """Ensure segments do not overlap in time. Trims previous end to next start."""
+    if len(segments) < 2:
+        return segments
+    # Sort by start to be safe
+    segments = sorted(segments, key=lambda s: s.get("start", 0))
+    out = [dict(segments[0])]
+    for seg in segments[1:]:
+        prev = out[-1]
+        cur = dict(seg)
+        if cur.get("start", 0) < prev.get("end", 0):
+            # Overlap detected; trim prev end
+            prev["end"] = max(prev["start"] + 0.1, cur["start"] - _OVERLAP_EPS_S)
+        out.append(cur)
+    return out
+
+
 def _shrink_silent_tail(seg: dict, seg_words: list[dict]) -> dict:
     """Shrink a segment's end back to its last word (+ small pad) when the
     segment window is bloated by trailing silence. Returns the original
@@ -325,6 +407,82 @@ def _shrink_silent_tail(seg: dict, seg_words: list[dict]) -> dict:
     return out
 
 
+def _split_at_silence(
+    seg: dict,
+    seg_words: list[dict],
+    gap_threshold: float = _SILENCE_SPLIT_GAP_S,
+) -> list[dict] | None:
+    """Hard split a segment at word gaps > gap_threshold. Returns None if no
+    large gap or if split would produce empty pieces. Each piece inherits
+    quality metrics and is clamped to its word span + pad."""
+    # Find gap indices
+    gaps = []
+    for i in range(1, len(seg_words)):
+        gap = seg_words[i]["start"] - seg_words[i - 1]["end"]
+        if gap > gap_threshold:
+            gaps.append(i)
+    if not gaps:
+        return None
+    # Need char-time map to slice text accurately
+    char_times = _build_char_time_map(seg["text"], seg_words)
+    if not char_times:
+        return None
+    coverage = _check_coverage(seg["text"], char_times)
+    if coverage < 0.9:
+        return None
+    # Build word → char index mapping via tokenizer units
+    phrased = _build_phrased_units(seg["text"], char_times)
+    if not phrased:
+        return None
+    phrased = _protect_technical_tokens(phrased)
+    # Phrased boundaries correspond to char-time units; but we need to map
+    # gap positions in seg_words to phrased indices. Use time overlap:
+    # assign each phrased unit to the nearest seg_word by start time.
+    # Simpler: reuse seg_words word boundaries directly for split points:
+    # map seg_words gap index → character position in seg["text"] via char_times keys
+    # char_times keys are orig indices; we can approximate split at word boundary
+    # by slicing seg["text"] at the phrased unit that starts at that word time.
+    pieces: list[dict] = []
+    prev_word_idx = 0
+    for gap_idx in gaps + [len(seg_words)]:
+        chunk_words = seg_words[prev_word_idx:gap_idx]
+        if not chunk_words:
+            prev_word_idx = gap_idx
+            continue
+        # Slice text via phrased units whose time falls inside chunk
+        c_start = chunk_words[0]["start"]
+        c_end = chunk_words[-1]["end"]
+        chunk_phrased = [u for u in phrased if u["start"] >= c_start - 0.05 and u["end"] <= c_end + 0.05]
+        if not chunk_phrased:
+            # Fallback: use word strings directly
+            text_piece = "".join(w.get("word", "") for w in chunk_words)
+        else:
+            text_piece = "".join(u.get("word", "") for u in chunk_phrased)
+        text_piece = text_piece.strip()
+        if not text_piece:
+            prev_word_idx = gap_idx
+            continue
+        piece = {
+            "start": chunk_words[0]["start"] - _SILENT_PAD_S * 0.5,
+            "end": chunk_words[-1]["end"] + _SILENT_PAD_S,
+            "text": text_piece,
+            "words": list(chunk_words),
+        }
+        # Clamp inside original window
+        piece["start"] = max(seg.get("start", 0), piece["start"])
+        piece["end"] = min(seg.get("end", 0), piece["end"])
+        if piece["end"] > piece["start"]:
+            pieces.append(piece)
+        prev_word_idx = gap_idx
+    if len(pieces) < 2:
+        return None
+    # Verify text integrity
+    combined = "".join(p.get("text", "") for p in pieces)
+    if combined.replace(" ", "").replace("\u200b", "") != seg["text"].replace(" ", "").replace("\u200b", ""):
+        return None
+    return pieces
+
+
 def _split_seg_with_words(
     seg: dict,
     seg_words: list[dict],
@@ -334,6 +492,31 @@ def _split_seg_with_words(
 ) -> list[dict]:
     """Try a scoring-based split using word timestamps; fall back to the
     ratio/punctuation splitter on any failure. Returns >=1 segments."""
+    # Hard silence split takes priority: a 0.8s+ gap inside a segment must
+    # produce separate subtitles even when the pre-gap chunk is short (e.g.
+    # "OK" before 2s silence). Scoring engine enforces MIN_LINE_CHARS and
+    # would otherwise keep them together.
+    hard = _split_at_silence(seg, seg_words, _SILENCE_SPLIT_GAP_S)
+    if hard is not None and len(hard) >= 2:
+        # Recursively refine each hard piece with scoring for residual overlong
+        refined: list[dict] = []
+        for piece in hard:
+            # Piece may still be overlong; run scoring split
+            sub_words = piece.get("words", [])
+            char_times = _build_char_time_map(piece["text"], sub_words)
+            if char_times and _check_coverage(piece["text"], char_times) >= 0.9:
+                phrased = _build_phrased_units(piece["text"], char_times)
+                if phrased:
+                    phrased = _protect_technical_tokens(phrased)
+                    if len(phrased) >= 2:
+                        max_dur = max_line_ms / 1000.0
+                        lines = _segment_words(phrased, max_chars=max_chars, max_dur=max_dur, pause_threshold=pause_threshold)
+                        if lines and "".join(l.get("text","") for l in lines).replace(" ", "").replace("\u200b","") == piece["text"].replace(" ", "").replace("\u200b",""):
+                            refined.extend(lines)
+                            continue
+            refined.append(piece)
+        return refined
+
     char_times = _build_char_time_map(seg["text"], seg_words)
     if not char_times:
         return _fallback_split(seg, max_chars, max_line_ms)
@@ -445,6 +628,14 @@ def _verify_times(units: list[dict], seg_start: float, seg_end: float) -> bool:
     return True
 
 
+def _should_force_split(seg: dict, seg_words: list[dict]) -> bool:
+    """Normal segment that internally spans a large silence gap should still be split."""
+    if len(seg_words) < 2:
+        return False
+    # Only care if gap is large enough to be a paragraph pause
+    return _has_large_pause(seg_words, _SILENCE_SPLIT_GAP_S)
+
+
 def refine_groq_segments(
     segments: list[dict],
     top_words: list[dict],
@@ -458,10 +649,14 @@ def refine_groq_segments(
     - Abnormal (overlong/overduration) segments are always re-segmented
       using the scoring engine (or the fallback splitter).
     - Normal segments keep their original boundary, but when the window is
-      bloated by trailing silence they are shrunk to the last word.
+      bloated by silence they are shrunk on both edges to the speech span.
+    - Normal segments that internally contain a large word gap (>0.8s) are
+      force-split via the scoring engine — these are the 19 silence-spanning
+      cases (2-16s gaps) that previously became double-length subtitles.
     - When ``full_segment`` is True every segment WITH usable word timestamps
       is passed through the scoring engine (not just abnormal ones).
-    - Finally, runs of adjacent tiny crumbs are merged back together.
+    - Finally, runs of adjacent tiny crumbs are merged back together and
+      overlaps are repaired.
     """
     assigned = _assign_words_to_segments(top_words, segments)
     out = []
@@ -475,10 +670,34 @@ def refine_groq_segments(
             if full_segment:
                 out.extend(_inherit_quality(seg, _split_seg_with_words(
                     seg, seg_words, max_chars, max_line_ms, pause_threshold)))
+            elif _should_force_split(seg, seg_words):
+                # Large internal silence → must split even though char/dur are normal
+                out.extend(_inherit_quality(seg, _split_seg_with_words(
+                    seg, seg_words, max_chars, max_line_ms, pause_threshold)))
             else:
-                out.append(_shrink_silent_tail(seg, seg_words))
+                shrunk_seg = _shrink_silent_edges(seg, seg_words)
+                # Preserve word timestamps for final post-shrink/deoverlap
+                if seg_words:
+                    shrunk_seg["words"] = list(seg_words)
+                out.append(shrunk_seg)
             continue
-        out.extend(_inherit_quality(seg, _split_seg_with_words(
-            seg, seg_words, max_chars, max_line_ms, pause_threshold)))
+        pieces = _split_seg_with_words(seg, seg_words, max_chars, max_line_ms, pause_threshold)
+        # If split returned original segment (no words), attach words for final shrink
+        if len(pieces) == 1 and not pieces[0].get("words"):
+            pieces[0]["words"] = list(seg_words)
+            pieces[0] = _shrink_silent_edges(pieces[0], seg_words)
+        out.extend(_inherit_quality(seg, pieces))
     out = _merge_fragments_groq(out)
-    return _absorb_isolated_crumbs(out)
+    out = _absorb_isolated_crumbs(out)
+    out = _deoverlap(out)
+    # Final edge shrink after merging/absorbing (merged windows can become bloated)
+    # Re-assign words for the merged segments is lossy, so only shrink when we have words
+    shrunk = []
+    for seg in out:
+        ws = seg.get("words", [])
+        if ws:
+            shrunk.append(_shrink_silent_edges(seg, ws))
+        else:
+            shrunk.append(seg)
+    # De-overlap again after shrink
+    return _deoverlap(shrunk)

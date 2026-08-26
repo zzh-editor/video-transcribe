@@ -1,8 +1,8 @@
 ---
 name: video-transcribe
 description: "视频音频转录为字幕。输入视频/音频本地文件，提取音频 → Whisper 转写（macOS 用 MLX 加速，其他用 faster-whisper） → 可选调用 srt-enhancer 润色 → 可选翻译（纯中文/中上原下/原上中下）→ 输出高精度 SRT 字幕文件。触发词：转录、转录音频、转录视频、转录字幕、把文件转成字幕、把音频转录成字幕、把视频转录成字幕、transcribe、transcribe audio、transcribe video、generate subtitles、generate srt、convert to srt"
-allowed-tools: [Read, Write, Edit, Bash, Glob, Grep]
-version: 3.0.0
+allowed-tools: [Read, Write, Edit, Bash, Glob, Grep, Question, Task, Skill, WebSearch]
+version: 3.0.1
 ---
 
 # video-transcribe
@@ -28,7 +28,7 @@ version: 3.0.0
 ④ refine_segments.py 预清洗 + 评分引擎断句 / Groq word adapter
       │   _clean_segments 去空/零时长/重复
       │   本地 → word-timestamp 评分引擎（pause/natural break/scored cuts）
-      │   Groq  → jieba 聚词 + 评分引擎（仅异常 segment）
+      │   Groq  → jieba 聚词 + 评分引擎（异常段必切 + 正常段含 ≥0.80s 词隙强制切 + 静默缩边 + 重叠修复）
       ▼
 ⑤ cleanup_segments.py 后清洗
       │   合并相邻重复（VAD 边界重叠 + 幻觉检测）
@@ -205,14 +205,15 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 - 音频文件不得超过 **25MB**（Groq 免费层限制），超过时提示用户改用本地模型
 - 无需 VAD 分片（API 服务端处理）
 - words 为字符级（中文单字），通过 `groq_word_adapter.py` 用 jieba 聚合为词组后评分
-- 仅超字符数或时长阈值的 segment 被重新断句，正常 segment 保留原始边界
-- 缺失 words、时间无效或覆盖率不足时按 segment 独立回退
+- 异常段（`char_count>max_chars` 或 `duration>max_line_ms`）必切；正常段若含 **≥0.80s 词隙**（`_SILENCE_SPLIT_GAP_S`）亦强制切（实测 19 处 1.5-16s 跨静默合并均需此）；否则仅做静默缩边（`_shrink_silent_edges` 缩首尾、`_SILENT_PAD_S=0.2s`）
+- 缺失 words、时间无效或覆盖率不足时按 segment 独立回退（`_fallback_split`）
 
 脚本特性：
 - 返回 `{segments, words}`；words 为清洗后的顶层字符级，不嵌入 segment
-- 异常检测：`_is_abnormal()` 基于 max_line_length / max_line_ms
+- 异常检测：`_is_abnormal()` 基于 max_line_length / max_line_ms；**静默硬切优先**：`_split_at_silence()` 在 `gap>0.80s` 处硬切（绕过 `MIN_LINE_CHARS`），剩余超长片再走评分
 - 对齐 → jieba 聚词 → 英文/技术标识符保护 → 复用 `_segment_words()` 评分
-- 局部回退：缺 words / 对齐失败 / 覆盖率 < 90% → `_fallback_split()` 标点比率兜底
+- 静默治理：`_shrink_silent_edges()` 双向缩首尾（`ratio<0.4` 且省 ≥0.8s 才缩）、`_deoverlap()` 修 279-500ms 重叠（`_OVERLAP_EPS_S=0.02s`）、`_absorb_isolated_crumbs()` 合并短词碎片
+- 局部回退：缺 words / 对齐失败 / 覆盖率 < 90% → `_fallback_split()` 标点比率兜底；`_inherit_quality()` 传递 `no_speech_prob/avg_logprob`
 
 ## Step 3: refine_segments.py 预清洗 + 语义断句优化
 
@@ -543,6 +544,9 @@ AI 处理完成后可清理 `tmp/` 目录。
 | config.json 损坏或格式无效 | 提示检查 JSON 格式，展示预期结构 | 用 Question 询问是否重新执行引擎选择流程 |
 | Groq 中文 prompt 被复述为幻觉（实测：`请准确转写专业术．保持简体中文。` 在全片静音段出现 20+ 处，no_speech_prob/avg_logprob 均正常，无法被质量指标识别） | 默认不传 prompt（`DEFAULT_GROQ_PROMPT=None`），如需传只传英文 prompt（实测英文 prompt 无复述幻觉但也无术语改善）；黑名单锚点 `请准确转写专业`/`保持简体中文` 清除残留 | 术语错识靠润色环节 correction-table 修正，不依赖 prompt |
 | Groq 静音窗口包含短词段（≤3 字符却 4-11s，如 `OK`/`然后`/`对然后`，word 时间戳覆盖整个窗口不可靠） | `_absorb_isolated_crumbs` 将孤立短词吸收进无缝衔接的后段（gap≤0.5s） | 保持原样（文本正确，仅时间轴未精确收缩） |
+| Groq 正常段跨大段静默合并（实测 19 处 1.5-16s，如 #87 2.3s/#167 5.9s/#394 6.9s 合并为单条双行字幕） | `_should_force_split` 检 `max_internal_gap>0.80s` → `_split_at_silence` 硬切（绕过 MIN_LINE_CHARS），剩余超长片再评分细切 | `_fallback_split` 标点比率兜底 |
+| Groq 输出时间重叠（实测 4 处 279-500ms，如 `100-112.5→101.8-102.6` 前段尾部压后段） | `_deoverlap()` 按 start 排序后 `prev.end = cur.start - 0.02s` 修正，二轮执行（合并后 + 终局缩边后） | 保持重叠（播放器取后段覆盖） |
+| Groq 段首尾静默膨胀（`ratio<0.4` 且首/尾各省 ≥0.8s，如 13s 窗口实际语音仅 1.1s） | `_shrink_silent_edges()` 双向缩至 `first_word.start-0.2s`/`last_word.end+0.2s`，合并后二轮缩边 | `_shrink_silent_tail` 仅缩尾（旧逻辑） |
 | Groq 对同一输入多次调用返回非确定段数（实测 137/163/172/282/269/524 不等） | 属 API 正常行为，重跑结果不同；段数差异大不代表代码 bug | 对比质量用单次结果，不追求段数一致 |
 | Groq 音频压缩质量损失（96-112kbps MP3 丢失高频细节） | 优先用 16kHz mono WAV（≤25MB 时），仍超限再压缩；文档推荐 16kHz mono FLAC 无损压缩优于 MP3 | 接受 MP3 压缩或切换本地模型 |
 
@@ -671,10 +675,23 @@ Groq `whisper-large-v3` 的 `verbose_json` 响应在顶层提供字符级 `words
 
 相邻满足 `_is_ascii_ident`（全 ASCII 字母/数字/`+#-_.&/`）的单元合并为单个 token，防止 `C++`、`NBA 2K`、`Dynamic Hair Pipeline` 被中间拆分。
 
-### 6. 异常检测 `_is_abnormal`
+### 6. 异常检测 `_is_abnormal` + 静默硬切触发 `_should_force_split`
 
-去空白字符数 > `max_chars` 或 duration（ms）> `max_line_ms` 时判定为异常。正常 segment 跳过所有处理，原样输出。
+去空白字符数 > `max_chars` 或 duration（ms）> `max_line_ms` 时判定为异常；**正常段若最大词隙 `_max_internal_gap > 0.80s`（`_SILENCE_SPLIT_GAP_S`）亦判定需强制切**（实测 W6 19 处跨 1.5-16s 静默的正常段由此捕获）。异常/强制切均走 `_split_seg_with_words()`。
 
-### 7. refine `refine_groq_segments`
+### 7. 静默治理 `_shrink_silent_edges` / `_deoverlap` / `_absorb_isolated_crumbs`
 
-对异常且带顶层 words 的 segment：映射 → 覆盖率检查 → jieba 精确分词 → 技术标识符保护 → 传入 `_segment_words()` 评分断句。任一步失败回退 `_fallback_split()`。正常 segment 或无 words segment 保留原始边界。每个 segment 独立验证文字守恒和时间单调。
+- `_shrink_silent_edges()`：双向缩首尾，仅当 `speech_span/duration < 0.4` 且省 ≥0.8s 才缩，首尾各留 `_SILENT_PAD_S=0.2s`；合并/吸收后二轮缩边 + 二轮去重叠
+- `_deoverlap()`：按 `start` 排序后，`cur.start < prev.end` 时 `prev.end = cur.start - 0.02s`（`_OVERLAP_EPS_S`），修 4 处 279-500ms 重叠
+- `_absorb_isolated_crumbs()`：`≤3 字且 >3.0s` 的孤立短词（如 OK/好）若与后段 `gap ≤0.5s` 则并入后段首部；`_merge_fragments_groq()` 合并 `≤5 字` 且词隙 `≤5.0s` 的碎片链
+
+### 8. 硬切优先 `_split_at_silence`
+
+`gap > 0.80s` 的词隙处硬切（绕过 `_DEFAULT_MIN_LINE_CHARS=8` 限制），每片按词组时间夹逼文本（`_build_phrased_units` + 时间重叠筛选），片间按字数守恒校验；硬切后的每片若仍超长再走 `_segment_words()` 评分二次细切。
+
+### 9. refine `refine_groq_segments`（总装）
+
+1. `_assign_words_to_segments()` 归属顶层 words
+2. 异常/强制切段 → `_split_seg_with_words()`（含硬切优先）→ `_inherit_quality()` 传递 `no_speech_prob/avg_logprob`
+3. 正常无大隙段 → `_shrink_silent_edges()` 仅缩边并保留 `words`
+4. 全量 `_merge_fragments_groq()` → `_absorb_isolated_crumbs()` → `_deoverlap()` → 二轮缩边 → 二轮去重叠；每段独立验证文字守恒和时间单调
