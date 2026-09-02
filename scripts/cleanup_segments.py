@@ -142,11 +142,18 @@ def cleanup(segments: list[dict]) -> list[dict]:
         return []
 
     # Step 2: merge consecutive segments with identical text (case-insensitive)
+    # Only when gap <= 1.0s — covers VAD boundary overlap without swallowing
+    # distant repetitions or stretching across silent windows.
+    MAX_DUP_MERGE_GAP_S = 1.0
     merged: list[dict] = [non_empty[0]]
     for s in non_empty[1:]:
         last = merged[-1]
         if s["text"].strip().lower() == last["text"].strip().lower():
-            last["end"] = s["end"]
+            gap = s.get("start", 0) - last.get("end", 0)
+            if gap <= MAX_DUP_MERGE_GAP_S:
+                last["end"] = s["end"]
+            else:
+                merged.append(s)
         else:
             merged.append(s)
 

@@ -7,6 +7,7 @@ uses jieba to aggregate into phrase-level timed units, then applies the
 existing scoring engine only to abnormal (overlong/overduration) segments.
 """
 
+import sys
 import unicodedata
 import warnings
 from pathlib import Path
@@ -68,6 +69,9 @@ _ABSORB_GAP_S = 0.5        # next segment starts within this = seamless
 # detect silence-window hallucinations. New segments produced by splitting or
 # merging inherit these from their parent so cleanup sees them later.
 _QUALITY_KEYS = ("no_speech_prob", "avg_logprob", "compression_ratio")
+
+# Single-char CJK function words that naturally attach to previous tail
+_CN_FUNCTION_WORDS = frozenset("的得地了着过吧吗呢啊呀哦")
 
 
 def _inherit_quality(parent: dict, children: list[dict]) -> list[dict]:
@@ -135,12 +139,16 @@ def _get_dict_path() -> Path:
 
 def _get_tokenizer():
     import jieba
+    import sys
     tok = jieba.Tokenizer()
     dict_path = _get_dict_path()
     if dict_path.exists():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)
             tok.load_userdict(str(dict_path))
+    else:
+        print(f"warning: jieba domain dict not found at {dict_path}, using default dictionary",
+              file=sys.stderr)
     return tok
 
 
@@ -186,7 +194,6 @@ def _build_char_time_map(seg_text: str, groq_words: list[dict]) -> dict:
             groq_concat += ch
             groq_times.append((w["start"], w["end"]))
     text_no_ws = seg_text.replace(" ", "").replace("\u200b", "")
-    norm_match = unicodedata.normalize("NFKC", text_no_ws.replace("", ""))
     norm_groq = unicodedata.normalize("NFKC", groq_concat)
     content_positions = []
     punct_positions = []
@@ -280,7 +287,12 @@ def _protect_technical_tokens(units: list[dict]) -> list[dict]:
         is_prev_ascii = _is_ascii_ident(prev_text)
         is_curr_ascii = _is_ascii_ident(curr_text)
         if is_prev_ascii and is_curr_ascii:
-            gap_text = prev["word"] + u["word"]  # no extra space, just concat adjacent units
+            # Keep a space between two alphabetic words (Rookie Awards) but
+            # not for symbols (C + + -> C++).
+            if prev_text.isalpha() and curr_text.isalpha():
+                gap_text = prev["word"] + " " + u["word"]
+            else:
+                gap_text = prev["word"] + u["word"]
             merged[-1] = {
                 "word": gap_text,
                 "start": prev["start"],
@@ -512,9 +524,18 @@ def _split_seg_with_words(
                         max_dur = max_line_ms / 1000.0
                         lines = _segment_words(phrased, max_chars=max_chars, max_dur=max_dur, pause_threshold=pause_threshold)
                         if lines and "".join(l.get("text","") for l in lines).replace(" ", "").replace("\u200b","") == piece["text"].replace(" ", "").replace("\u200b",""):
-                            refined.extend(lines)
+                            # verify before accepting scored lines
+                            if _verify_text(lines, piece["text"]) and _verify_times(lines, piece.get("start", 0), piece.get("end", 0)):
+                                refined.extend(lines)
+                            else:
+                                print(f"warning: hard-split piece verify failed at {piece.get('start'):.2f}s",
+                                      file=sys.stderr)
+                                refined.append(piece)
                             continue
             refined.append(piece)
+        if not _verify_segments_integrity(refined, "hard-split"):
+            print("warning: hard-split integrity failed, fallback to original segment", file=sys.stderr)
+            return _fallback_split(seg, max_chars, max_line_ms)
         return refined
 
     char_times = _build_char_time_map(seg["text"], seg_words)
@@ -542,7 +563,137 @@ def _split_seg_with_words(
     if (combined_text.replace(" ", "").replace("\u200b", "")
             != seg["text"].replace(" ", "").replace("\u200b", "")):
         return [seg]
+    # Verify mutation integrity — fallback on failure
+    if not _verify_text(lines, seg["text"]):
+        print(f"warning: split text mismatch for segment {seg.get('start'):.2f}s, fallback",
+              file=sys.stderr)
+        return _fallback_split(seg, max_chars, max_line_ms)
+    if not _verify_times(lines, seg.get("start", 0), seg.get("end", 0)):
+        print(f"warning: split time invalid for segment {seg.get('start'):.2f}s, fallback",
+              file=sys.stderr)
+        return _fallback_split(seg, max_chars, max_line_ms)
     return lines
+
+
+def _is_ascii_word(text: str) -> bool:
+    t = text.strip()
+    return bool(t) and all(c.isascii() and (c.isalnum() or c in "+-#_.&/") or c == " " for c in t) and any(c.isalpha() for c in t)
+
+
+import re as _re_merge
+
+_TRAILING_ASCII_RE = _re_merge.compile(r"[A-Za-z0-9][A-Za-z0-9+\-#_.&/]*$")
+_LEADING_ASCII_RE = _re_merge.compile(r"^[A-Za-z0-9][A-Za-z0-9+\-#_.&/]*")
+
+
+def _trailing_ascii(text: str) -> str | None:
+    m = _TRAILING_ASCII_RE.search(text.strip())
+    return m.group(0) if m else None
+
+
+def _leading_ascii(text: str) -> str | None:
+    m = _LEADING_ASCII_RE.search(text.strip())
+    return m.group(0) if m else None
+
+
+def _merge_english_phrase_segments(segments: list[dict]) -> list[dict]:
+    """Merge adjacent English phrase segments split across Groq windows (e.g. Rookie / Awards).
+
+    Groq often wraps a Chinese sentence with an embedded English phrase and the
+    English words land on different windows: ``国际性的这个Rookie`` + ``Awards这个比赛``.
+    The suffix/prefix extraction handles hybrid segments — the whole token check
+    would miss because the text contains CJK.
+    """
+    if len(segments) < 2:
+        return segments
+    out: list[dict] = []
+    i = 0
+    n = len(segments)
+    while i < n:
+        seg = segments[i]
+        if i + 1 < n:
+            nxt = segments[i + 1]
+            prev_text = seg.get("text", "").strip()
+            nxt_text = nxt.get("text", "").strip()
+            gap = nxt.get("start", 0) - seg.get("end", 0)
+            trailing = _trailing_ascii(prev_text)
+            leading = _leading_ascii(nxt_text)
+            if gap <= 0.6 and trailing and leading:
+                # Check if merging keeps reasonable length and phrase is continuous speech
+                merged_text = prev_text + " " + nxt_text
+                if len(merged_text.replace(" ", "")) <= 60:
+                    merged = {
+                        "start": seg["start"],
+                        "end": nxt["end"],
+                        "text": merged_text,
+                    }
+                    for k in _QUALITY_KEYS:
+                        if k in seg:
+                            merged[k] = seg[k]
+                        elif k in nxt:
+                            merged[k] = nxt[k]
+                    # merge word lists if present
+                    w = []
+                    if seg.get("words"):
+                        w.extend(seg["words"])
+                    if nxt.get("words"):
+                        w.extend(nxt["words"])
+                    if w:
+                        merged["words"] = w
+                    out.append(merged)
+                    i += 2
+                    continue
+        out.append(seg)
+        i += 1
+    return out
+
+
+def _attach_cn_particle(segments: list[dict]) -> list[dict]:
+    """Attach a lone CJK function-word fragment (``的``/``了`` etc.) that sits
+    between two longer utterances back onto the previous segment. Groq can
+    split ``在一线在职的`` into ``在一线在职`` + ``的`` + next sentence, leaving
+    a 1-char orphan that ``_merge_fragments_groq`` does not catch because its
+    neighbours are long."""
+    if len(segments) < 2:
+        return segments
+    out: list[dict] = []
+    i = 0
+    n = len(segments)
+    while i < n:
+        if out and i < n:
+            prev = out[-1]
+            cur = segments[i]
+            cur_text = cur.get("text", "").strip()
+            # single-char CJK function word orphan
+            if len(cur_text) == 1 and cur_text in _CN_FUNCTION_WORDS:
+                prev_text = prev.get("text", "").strip()
+                gap = cur.get("start", 0) - prev.get("end", 0)
+                if prev_text and prev_text[-1] not in _PUNCT and gap < _MERGE_GAP_S + 0.2:
+                    # avoid ``的的`` stacking
+                    if not (prev_text[-1] == cur_text):
+                        combined = prev_text + cur_text
+                        if len(combined.replace(" ", "")) <= 60:
+                            out[-1] = {
+                                "start": prev["start"],
+                                "end": cur["end"],
+                                "text": combined,
+                            }
+                            # carry words if present
+                            w = []
+                            if prev.get("words"):
+                                w.extend(prev["words"])
+                            if cur.get("words"):
+                                w.extend(cur["words"])
+                            if w:
+                                out[-1]["words"] = w
+                            for k in _QUALITY_KEYS:
+                                if k in prev:
+                                    out[-1][k] = prev[k]
+                            i += 1
+                            continue
+        out.append(segments[i])
+        i += 1
+    return out
 
 
 def _merge_fragments_groq(segments: list[dict]) -> list[dict]:
@@ -610,7 +761,7 @@ def _merge_fragments_groq(segments: list[dict]) -> list[dict]:
 
 
 def _verify_text(units: list[dict], orig_text: str) -> bool:
-    reconstructed = "".join(u["word"] for u in units)
+    reconstructed = "".join(u.get("word", u.get("text", "")) for u in units)
     reco_stripped = reconstructed.replace(" ", "").replace("\u200b", "")
     orig_stripped = orig_text.replace(" ", "").replace("\u200b", "")
     return reco_stripped == orig_stripped
@@ -628,6 +779,24 @@ def _verify_times(units: list[dict], seg_start: float, seg_end: float) -> bool:
     return True
 
 
+def _verify_segments_integrity(segments: list[dict], context: str) -> bool:
+    """Runtime invariant: segments must be monotonic, non-overlapping, non-empty text."""
+    for idx, seg in enumerate(segments):
+        if seg.get("end", 0) <= seg.get("start", 0):
+            print(f"warning: groq_word_adapter [{context}] segment {idx} bad time "
+                  f"{seg.get('start')} -> {seg.get('end')}", file=sys.stderr)
+            return False
+        if not seg.get("text", "").strip():
+            print(f"warning: groq_word_adapter [{context}] segment {idx} empty text",
+                  file=sys.stderr)
+            return False
+        if idx > 0 and seg.get("start", 0) < segments[idx - 1].get("end", 0) - 0.01:
+            print(f"warning: groq_word_adapter [{context}] overlap at {idx} "
+                  f"{segments[idx-1].get('end')} -> {seg.get('start')}", file=sys.stderr)
+            return False
+    return True
+
+
 def _should_force_split(seg: dict, seg_words: list[dict]) -> bool:
     """Normal segment that internally spans a large silence gap should still be split."""
     if len(seg_words) < 2:
@@ -639,8 +808,8 @@ def _should_force_split(seg: dict, seg_words: list[dict]) -> bool:
 def refine_groq_segments(
     segments: list[dict],
     top_words: list[dict],
-    max_chars: int = 25,
-    max_line_ms: int = 4000,
+    max_chars: int = 15,
+    max_line_ms: int = 3000,
     pause_threshold: float = 0.3,
     full_segment: bool = False,
 ) -> list[dict]:
@@ -658,6 +827,16 @@ def refine_groq_segments(
     - Finally, runs of adjacent tiny crumbs are merged back together and
       overlaps are repaired.
     """
+    # Pre-merge English phrase split across Groq windows (e.g. Rookie / Awards)
+    # before per-segment abnormal handling, so the phrase is kept together and
+    # the combined window is split with proper Chinese breaks.
+    # Only when we have word timestamps can we safely re-split the merged
+    # window with the scoring engine; for the no-word SRT fallback keep
+    # original boundaries to avoid creating an overlong merged line.
+    if len(segments) > 1 and top_words:
+        pre = _merge_english_phrase_segments(segments)
+        if len(pre) != len(segments):
+            segments = pre
     assigned = _assign_words_to_segments(top_words, segments)
     out = []
     for seg_idx, seg in enumerate(segments):
@@ -682,14 +861,53 @@ def refine_groq_segments(
                 out.append(shrunk_seg)
             continue
         pieces = _split_seg_with_words(seg, seg_words, max_chars, max_line_ms, pause_threshold)
+        # Verify split integrity before extending; fallback to original on failure
+        if not _verify_segments_integrity(pieces, f"split-seg-{seg_idx}"):
+            print(f"warning: split verification failed for seg {seg_idx}, keeping original",
+                  file=sys.stderr)
+            pieces = [seg]
+            if seg_words:
+                pieces[0] = dict(pieces[0])
+                pieces[0]["words"] = list(seg_words)
         # If split returned original segment (no words), attach words for final shrink
         if len(pieces) == 1 and not pieces[0].get("words"):
             pieces[0]["words"] = list(seg_words)
             pieces[0] = _shrink_silent_edges(pieces[0], seg_words)
         out.extend(_inherit_quality(seg, pieces))
+    # Mutation exit 1: after merge fragments
+    _merge_before = len(out)
     out = _merge_fragments_groq(out)
+    # Only merge English phrases when we have word timestamps to re-split
+    # otherwise a no-word SRT merge (e.g. 10+21=31 chars) becomes super-long with no fallback
+    if top_words:
+        out = _merge_english_phrase_segments(out)
+    out = _attach_cn_particle(out)
+    # Re-split any still-abnormal segments created by merging (e.g. Rookie + Awards -> 31ch)
+    # Allow a small tolerance (+3 chars) for phrase integrity (Rookie Awards = 18)
+    # to avoid re-splitting a phrase-preserving segment and breaking the word.
+    resplit: list[dict] = []
+    for seg in out:
+        if _is_abnormal(seg, max_chars + 3, max_line_ms):
+            ws = seg.get("words", [])
+            if ws:
+                pieces = _split_seg_with_words(seg, ws, max_chars, max_line_ms, pause_threshold)
+                if pieces and len(pieces) > 1:
+                    resplit.extend(_inherit_quality(seg, pieces))
+                else:
+                    fb = _fallback_split(seg, max_chars, max_line_ms)
+                    resplit.extend(_inherit_quality(seg, fb if fb else [seg]))
+            else:
+                resplit.append(seg)
+        else:
+            resplit.append(seg)
+    out = resplit
+    if not _verify_segments_integrity(out, "merge-fragments"):
+        print("warning: merge-fragments integrity check failed", file=sys.stderr)
+    # Mutation exit 2: after absorb + deoverlap
     out = _absorb_isolated_crumbs(out)
     out = _deoverlap(out)
+    if not _verify_segments_integrity(out, "deoverlap-1"):
+        print("warning: deoverlap-1 integrity check failed", file=sys.stderr)
     # Final edge shrink after merging/absorbing (merged windows can become bloated)
     # Re-assign words for the merged segments is lossy, so only shrink when we have words
     shrunk = []
@@ -699,5 +917,8 @@ def refine_groq_segments(
             shrunk.append(_shrink_silent_edges(seg, ws))
         else:
             shrunk.append(seg)
-    # De-overlap again after shrink
-    return _deoverlap(shrunk)
+    # De-overlap again after shrink — final mutation exit
+    final = _deoverlap(shrunk)
+    if not _verify_segments_integrity(final, "final"):
+        print("warning: final deoverlap integrity check failed", file=sys.stderr)
+    return final

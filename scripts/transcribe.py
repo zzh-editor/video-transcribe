@@ -196,11 +196,49 @@ def _transcribe_vad_chunks(audio_path: str, model_name: str, language: str | Non
             audio_np, path_or_hf_repo=model_name,
             language=language, word_timestamps=True,
             initial_prompt=INITIAL_PROMPT_ZH if language and language.startswith("zh") else None,
+            logprob_threshold=-1.0,
+            no_speech_threshold=0.6,
         )
         all_segments = result.get("segments", [])
 
     all_segments.sort(key=lambda s: s.get("start", 0))
     return all_segments
+
+
+# ── Shared post-processing ─────────────────────────────────────────
+
+def _postprocess(segments: list[dict], max_line_length: int, max_line_ms: int) -> list[dict]:
+    """Shared refine + cleanup pipeline for both mlx and faster-whisper."""
+    if not segments:
+        return segments
+    raw_count = len(segments)
+    out = segments
+    try:
+        from refine_segments import refine as refine_segs
+        before = len(out)
+        out = refine_segs(out, max_chars=max_line_length, max_line_ms=max_line_ms)
+        if len(out) != before:
+            print(f"refine_segments: {before} → {len(out)} segments (semantic + length split)",
+                  file=sys.stderr)
+    except ImportError:
+        print("refine_segments not available, skipping", file=sys.stderr)
+    except Exception as e:
+        print(f"refine_segments error ({e}), skipping", file=sys.stderr)
+
+    try:
+        from cleanup_segments import cleanup as cleanup_segs
+        before_c = len(out)
+        out = cleanup_segs(out)
+        if len(out) != before_c:
+            print(f"cleanup_segments: {before_c} → {len(out)} segments (removed empty/duplicate)",
+                  file=sys.stderr)
+    except ImportError:
+        print("cleanup_segments not available, skipping", file=sys.stderr)
+    except Exception as e:
+        print(f"cleanup_segments error ({e}), skipping", file=sys.stderr)
+
+    print(f"segments: {raw_count} raw segs → {len(out)} segments", file=sys.stderr)
+    return out
 
 
 # ── Transcribe backends ────────────────────────────────────────────
@@ -231,6 +269,8 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
             language=language,
             word_timestamps=True,
             initial_prompt=INITIAL_PROMPT_ZH if language and language.startswith("zh") else None,
+            logprob_threshold=-1.0,
+            no_speech_threshold=0.6,
         )
         raw_segments = result.get("segments", [])
 
@@ -241,38 +281,58 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
         print("error: no segments in mlx-whisper output", file=sys.stderr)
         sys.exit(1)
 
-    raw_count = len(raw_segments)
+    return _postprocess(raw_segments, max_line_length, max_line_ms)
 
+
+def transcribe_faster(audio_path: str, model_name: str, language: str | None,
+                      max_line_length: int, pause_threshold: float,
+                      max_line_ms: int, vad: bool = False) -> list[dict]:
+    """Transcribe via faster-whisper (CTranslate2). Mirrors transcribe_mlx interface."""
+    models_dir = get_model_path()
+    os.environ["HF_HOME"] = models_dir
+
+    from faster_whisper import WhisperModel
+
+    print(f"engine: faster-whisper", file=sys.stderr)
+    print(f"model: {model_name}", file=sys.stderr)
+    print(f"device: auto (CTranslate2)", file=sys.stderr)
+    print(f"    transcribing: {audio_path}", file=sys.stderr)
+
+    t0 = time.time()
+
+    model = WhisperModel(model_name, download_root=models_dir, device="auto")
+
+    # faster-whisper API compatibility: initial_prompt may not exist in older versions
+    transcribe_kwargs: dict = dict(
+        language=language,
+        word_timestamps=True,
+        vad_filter=vad,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+    )
+    # Probe for initial_prompt support
     try:
-        from refine_segments import refine as refine_segs
-        before = len(raw_segments)
-        out = refine_segs(raw_segments, max_chars=max_line_length,
-                          max_line_ms=max_line_ms)
-        if len(out) != before:
-            print(f"refine_segments: {before} → {len(out)} segments (semantic + length split)",
-                  file=sys.stderr)
-    except ImportError:
-        print("refine_segments not available, skipping", file=sys.stderr)
-        out = raw_segments
+        import inspect
+        sig = inspect.signature(model.transcribe)
+        if "initial_prompt" in sig.parameters:
+            transcribe_kwargs["initial_prompt"] = INITIAL_PROMPT_ZH if language and language.startswith("zh") else None
     except Exception:
-        print("refine_segments error, skipping", file=sys.stderr)
-        out = raw_segments
+        pass
 
-    try:
-        from cleanup_segments import cleanup as cleanup_segs
-        before_c = len(out)
-        out = cleanup_segs(out)
-        if len(out) != before_c:
-            print(f"cleanup_segments: {before_c} → {len(out)} segments (removed empty/duplicate)",
-                  file=sys.stderr)
-    except ImportError:
-        print("cleanup_segments not available, skipping", file=sys.stderr)
-    except Exception:
-        print("cleanup_segments error, skipping", file=sys.stderr)
+    segments_iter, info = model.transcribe(audio_path, **transcribe_kwargs)
+    # faster-whisper returns generator of Segment objects
+    raw_list = list(segments_iter)
+    raw_segments = _normalize_segments(raw_list)
 
-    print(f"segments: {raw_count} raw segs → {len(out)} segments",
-          file=sys.stderr)
-    return out
+    elapsed = time.time() - t0
+    print(f"transcription took {elapsed:.1f}s (language: {info.language} "
+          f"p={info.language_probability:.2f})", file=sys.stderr)
+
+    if not raw_segments:
+        print("error: no segments in faster-whisper output", file=sys.stderr)
+        sys.exit(1)
+
+    return _postprocess(raw_segments, max_line_length, max_line_ms)
 
 
 # ── SRT writer ─────────────────────────────────────────────────────
@@ -339,10 +399,10 @@ def main():
     parser.add_argument("audio", help="audio file path (WAV 16kHz mono)")
     parser.add_argument("--output", "-o", help="output SRT path")
     parser.add_argument("--language", "-l", help="language code (e.g. zh, en)")
-    parser.add_argument("--max-line-length", type=int, default=25,
-                        help="max characters per subtitle line (default: 25)")
-    parser.add_argument("--max-line-ms", type=int, default=6000,
-                        help="max duration per subtitle block in ms (default: 6000)")
+    parser.add_argument("--max-line-length", type=int, default=15,
+                        help="max characters per subtitle line (default: 15)")
+    parser.add_argument("--max-line-ms", type=int, default=3000,
+                        help="max duration per subtitle block in ms (default: 3000)")
     parser.add_argument("--pause-ms", type=int, default=None,
                         help="pause threshold for sentence split in ms (default: 300 zh / 500 en)")
     parser.add_argument("--full-segment", action="store_true", default=False,
@@ -413,11 +473,13 @@ def main():
         try:
             from groq_word_adapter import refine_groq_segments
             before = len(segments)
+            # Groq default 150ms; user --pause-ms takes precedence
+            groq_pause = (args.pause_ms / 1000.0) if args.pause_ms is not None else 0.15
             segments = refine_groq_segments(
                 segments, top_words,
                 max_chars=args.max_line_length,
                 max_line_ms=args.max_line_ms,
-                pause_threshold=0.15,
+                pause_threshold=groq_pause,
                 full_segment=args.full_segment,
             )
             if len(segments) != before:

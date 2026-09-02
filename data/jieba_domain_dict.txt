@@ -1,0 +1,21 @@
+# jieba 领域词典（示例最小可用版）
+# 格式：词语 词频 词性
+# 按需增补领域术语，UTF-8 每行一条
+哔哩哔哩 1000 n
+大模型 1000 n
+机器学习 1000 n
+深度学习 1000 n
+提示词 1000 n
+向量数据库 1000 n
+微调 800 v
+Embedding 800 n
+LLM 800 n
+AIGC 800 n
+Stable Diffusion 800 n
+Midjourney 800 n
+Sora 800 n
+Whisper 800 n
+Groq 800 n
+Maya 800 n
+Blender 800 n
+Python 800 n

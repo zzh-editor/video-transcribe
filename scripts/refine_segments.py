@@ -78,8 +78,8 @@ SEMANTIC_START = frozenset({
     "如果说", "那我们", "所以说",
 })
 
-_DEFAULT_MAX_CHARS = 25
-_DEFAULT_MAX_LINE_MS = 4000
+_DEFAULT_MAX_CHARS = 15
+_DEFAULT_MAX_LINE_MS = 3000
 _DEFAULT_MIN_LINE_CHARS = 8
 _PREFERRED_MAX_CHARS = 15  # scoring preference, not a hard limit (manual ~12 chars)
 _SEMANTIC_MIN_CHARS = 12   # line length before a SEMANTIC_START break is rewarded
@@ -353,21 +353,50 @@ def _find_split(text: str, char_pos: int, target_chars: int,
         if c > char_pos and text[c] in "，、。？！；：":
             return c + 1
 
-    # 2. Try space backward (English word boundary)
+    # 2. Try space backward (English word boundary) — skip spaces inside an
+    # English phrase (Rookie Awards) so the phrase stays together.
     for c in range(end, max(char_pos, end - 15), -1):
         if c > char_pos and text[c - 1] == " ":
+            # Don't split a space that is sandwiched by English letters
+            if c - 2 >= 0 and c < len(text) and _is_eng(text[c - 2]) and _is_eng(text[c]):
+                continue
             return c
 
-    # 3. Try space forward
+    # 3. Try space forward — same phrase protection
     for c in range(end, min(len(text), end + 10)):
         if text[c] == " ":
+            if c - 1 >= 0 and c + 1 < len(text) and _is_eng(text[c - 1]) and _is_eng(text[c + 1]):
+                continue
             return c + 1
 
-    # 4. Protect English words — don't split mid-word
+    # 4. Protect English words — don't split mid-word; also don't split
+    # inside an English phrase (Rookie Awards) — treat the whole phrase as one unit.
     if end > char_pos and end < len(text) and _is_eng(text[end - 1]) and _is_eng(text[end]):
         for c in range(end, min(len(text), end + 10)):
             if not _is_eng(text[c]):
+                # Skip a space that is sandwiched by English letters (phrase-internal)
+                if text[c] == " " and c + 1 < len(text) and _is_eng(text[c + 1]) and c - 1 >= 0 and _is_eng(text[c - 1]):
+                    continue
                 return c
+    # Also handle case where end lands exactly on the phrase-internal space
+    if end > char_pos and end < len(text) and text[end] == " " and end - 1 >= 0 and end + 1 < len(text) and _is_eng(text[end - 1]) and _is_eng(text[end + 1]):
+        # end is the space between Rookie and Awards — jump over the whole phrase
+        for c in range(end + 1, min(len(text), end + 16)):
+            if not _is_eng(text[c]):
+                if text[c] == " " and c + 1 < len(text) and _is_eng(text[c + 1]) and _is_eng(text[c - 1]):
+                    continue
+                return c
+
+    # 4b. Protect Chinese words — don't split inside a jieba word (e.g. 比赛)
+    if end > char_pos and end < len(text) and _is_cn_char(text[end - 1]) and _is_cn_char(text[end]):
+        try:
+            import jieba
+            toks = list(jieba.tokenize(text))
+            for word, s, e in toks:
+                if s < end < e:
+                    return e
+        except Exception:
+            pass
 
     # 5. Bad-line-start check: if candidate starts with BAD_LINE_START, push forward
     candidate = text[char_pos:end].strip()
@@ -463,14 +492,16 @@ def _is_eng_fragment(seg: dict) -> bool:
 
 def _is_cn_fragment(seg: dict) -> bool:
     """True if the segment is a short pure-Chinese remnant
-    (e.g. "集" split off from "作品集", or "西" from "东西")."""
+    (e.g. "集" split off from "作品集", or "西" from "东西").
+    Duration gate is relaxed to 0.8s for Chinese (3 chars at natural speed
+    can be ~0.6s, e.g. "一块的" 0.56s); English remnants stay at 0.5s."""
     text = seg.get("text", "").strip()
     if not text or len(text) > _FRAGMENT_MAX_CHARS:
         return False
     if not all(_is_cn_char(c) for c in text):
         return False
     dur = seg.get("end", 0) - seg.get("start", 0)
-    return dur < _FRAGMENT_MAX_DUR_S
+    return dur < 0.8
 
 
 def _cn_fragment_fits(prev_text: str, frag_text: str) -> bool:
@@ -490,6 +521,14 @@ def _cn_fragment_fits(prev_text: str, frag_text: str) -> bool:
     except ImportError:
         return True
     probe = prev_text[-3:] + frag_text
+    # 2-3 char CJK tail like “块的” after “加在一” — probe “加在一块的”
+    # ends with the fragment and is longer; that's a natural continuation
+    # even when jieba splits it into multiple tokens (e.g. “一块”+“的”).
+    if len(frag_text) > 1 and probe.endswith(frag_text) and len(probe) > len(frag_text):
+        # limit to when the suffix boundary is inside a single word scope
+        # (last 3 chars + frag overlapping) to avoid over-eager merges
+        if len(frag_text) <= 3:
+            return True
     tokens = jieba.lcut(probe)
     last = tokens[-1] if tokens else ""
     return last.endswith(frag_text) and len(last) > len(frag_text)
@@ -529,7 +568,16 @@ def _merge_fragments(segments: list[dict], max_chars: int) -> list[dict]:
         if (prev_text and curr_text
                 and _is_eng(prev_text[-1]) and _is_eng(curr_text[0])
                 and _gap_s(prev, seg) < _MERGE_GAP_S):
-            combined = prev_text + curr_text
+            # Two separate English words (e.g. Rookie / Awards) vs a single
+            # broken word (e.g. posit / ion). Use a space when both sides look
+            # like complete words (>3 chars or capitalised new word).
+            need_space = False
+            if curr_text and curr_text[0].isupper() and prev_text[-1].islower():
+                need_space = True
+            elif len(prev_text) > 3 and len(curr_text) > 3:
+                # both substantial -> likely two words (Rookie Awards)
+                need_space = True
+            combined = (prev_text + " " + curr_text) if need_space else (prev_text + curr_text)
             if len(combined.replace(" ", "")) <= _MERGE_HARD_LIMIT:
                 out[-1] = {
                     "start": prev["start"],

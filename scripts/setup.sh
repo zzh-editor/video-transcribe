@@ -13,17 +13,20 @@ fi
 
 echo "[setup] installing Python dependencies..."
 
-# ── Whisper引擎 ──────────────────────────────────────────────────
-venv/bin/pip install --quiet mlx-whisper faster-whisper socksio soundfile
+# ── 通用依赖 ──────────────────────────────────────────────────
+venv/bin/pip install --quiet socksio requests jieba==0.42.1
 
-# ── Groq API ────────────────────────────────────────────────────
-venv/bin/pip install --quiet requests
-
-# ── jieba 中文分词（Groq 中文 word timestamp 适配）───────────
-venv/bin/pip install --quiet jieba==0.42.1
-
-# ── VAD (silero-vad-notorch + onnxruntime, no torch) ─────────────
-venv/bin/pip install --quiet silero-vad-notorch onnxruntime
+# ── Whisper 引擎（按平台分支）───────────────────────────────────
+if [[ "$(uname)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+    echo "[setup] macOS arm64 — installing mlx-whisper + VAD..."
+    venv/bin/pip install --quiet mlx-whisper soundfile silero-vad-notorch onnxruntime
+    # faster-whisper 可选，未强制，避免额外失败面
+    venv/bin/pip install --quiet faster-whisper || echo "[setup] warning: faster-whisper optional install failed" >&2
+else
+    echo "[setup] non-macOS — installing faster-whisper..."
+    venv/bin/pip install --quiet faster-whisper
+    # silero VAD 在非 macOS 不强制，faster-whisper 自带 vad_filter
+fi
 
 if [ ! -d models ]; then
     echo "[setup] creating models directory..."

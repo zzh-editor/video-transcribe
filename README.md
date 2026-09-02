@@ -67,12 +67,12 @@ generate subtitles / generate srt / convert to srt
 |------|------|
 | 引擎可选 | 本地模型（mlx-whisper / faster-whisper）或 Groq API |
 | VAD 长音频分片 | Silero VAD 自动切割静音段，>10min 默认开启 |
-| ASR 降噪 | logprob_threshold=-1.0 + no_speech_threshold=0.6 |
+| ASR 解码抑制参数 | 两路径统一显式配置 logprob_threshold=-1.0 + no_speech_threshold=0.6 |
 | 评分引擎断句 | 基于 word timestamps + pause/标点评分的断句算法（本地模型） |
 | Groq 顶层 words + jieba | Groq 请求字符级顶层 words，仅对超限 segment 用 jieba 聚词+评分重拆分 |
 | Groq 英文碎片合并 | 自动合并 "posit"+"ion" 等跨段英文碎片 |
 | Groq 局部回退 | words 缺失/对齐失败时按 segment 回退，不影响整份字幕 |
-| 幻觉检测 | 重复字符循环过滤，黑名单模式 |
+| 幻觉检测 | 四规则并联：重复循环/黑名单/密度(≥15字/s 且 <1s)/质量指标(no_speech_prob≥0.8 + avg_logprob≤-1.0) |
 | 可选润色 | 调用 srt-enhancer 去口癖/纠错/空格 |
 | 可选翻译 | AI 逐段翻译，支持 3 种排版模式 |
 | 竖屏字幕输出 | 清理临时文件前可选调用 srt-enhancer 竖屏管线，输出 9:16 竖版断句字幕（每行 4-12 字、按语义边界断句、时间轴按字数比例重排） |
@@ -101,7 +101,7 @@ video-transcribe/
 - requests + API Key（Groq API）
 
 **中文分词（Groq 模式）：**
-- jieba 0.42.1 + 领域词典（`data/jieba_domain_dict.txt`）
+- jieba 0.42.1 + 领域词典（`data/jieba_domain_dict.txt`，未找到时降级为默认词典并 warning）
 
 **本地模型优化（可选，失败自动降级）：**
 - silero-vad-notorch + onnxruntime（macOS 长音频 VAD 预分片）

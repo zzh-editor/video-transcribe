@@ -95,6 +95,17 @@
 
 全片同一术语保持同一种英文写法，不得前后不一致。剥离与纠正后的术语需全片统一（如全用 `joint` 而非 `jointt`/`joints` 混用，除非原文单复数有意区分）。
 
+### 7. 技术术语精确替换（人工校对高频修正）
+
+以下术语在技术语境中有精确含义，不得混用或替换为日常口语词：
+
+- **阻尼/弹簧行为：** resistive force 统一用 `damping force`，不用 `friction force`（摩擦力是另一个物理概念）。阻尼系数用 `damping coefficient`，不用"摩擦系数"。`stiffness` 和 `damping` 是成对参数，不要交替用 `term`/`coefficient` 指代。
+- **微分方程类型：** `ODE`（Ordinary Differential Equation，常微分方程）≠ `PDE`（Partial Differential Equation，偏微分方程）。课程中弹簧系统是 ODE，不要写成"partial differential"。
+- **数值方法描述：** RK4 是 `general-purpose numerical method`（通用数值方法），不是 `general solution`（通解，是 ODE 理论中的概念）。
+- **公式变量：** 变量先定义再使用。定义顺序：符号 → 含义。如 `x is the displacement`（不是"x is our rest"）。位移用 `displacement`，不用"rest"或"length"。
+- **数学符号：** 阻尼系数用希腊字母 `μ`，不要拼写成 `mu`。公式中 `dt²` 必须写出平方，不能省略为 `dt`。
+- **Hooke's Law 术语：** `restoring force`（回复力）、`spring stiffness`（弹簧刚度）、`displacement`（位移）、`rest position`（静止位置）。不要用"natural position"替代"rest position"。
+
 ---
 
 ## 三、语言与可读性（适配英文 SRT 节奏）
@@ -102,7 +113,12 @@
 - **简洁口语化，贴近课堂英文：** 英文停留时间短，译文要短、顺、一眼可读。在不丢信息前提下用短句、主动语态、常用词，避免书面长句堆砌。
 - **语序按英文习惯调整，不重组信息：** 中文长句、流水句、意合结构，按英文习惯断句与衔接（如加 `so`/`then`/`which`），使单条自然；不得增删信息或改变逻辑，也不得跨条搬运。
 - **口癖与语气词：** 中文输入的 `那个、然后、就是、其实、这边、的话` 等无信息口癖，英文可不译或译为最简的 `so`/`then`/`okay`；承载信息或态度时保留（如 `其实就是` 强调时可译 `actually`）。
-- **数字、单位与公式：** 数字保持原值；度量单位保留英文（如 `6 inches`），必要时保留原文已有的换算；版本号、分辨率、货币保持原值。公式与物理符号原样保留，如 `F = -k(p - т)`、`F = -k(p-т) - μV`、`x = p - r`、`a = -k/m * x - μ/m * v`、`Hooke's Law`、`Simple Harmonic Motion`、`Damped Harmonic Motion`、`Semi-Implicit Euler Integrator`、`Explicit Euler`、`RK4`、`ODE`。
+- **删除口语填充与铺垫：** 以下表达在字幕中必须删除或替换为直接陈述——`you can think of it as`（直接给结论）、`what is X`（直接定义 X）、`the thing about it is`（直接说特征）、`So what does this correspond to`（直接给出对应关系）、`or undergo deletion`（删除冗余的同义并列）。字幕不是逐字转录，是信息传递，不要保留演讲者的犹豫和铺垫。
+- **逻辑连接词不要堆叠：** 不要每句开头都用 `So` 或 `And`。技术讲解中逻辑关系应通过句子内容传达。如需连接，选最精确的一个（`therefore`、`thus`、`this gives us`、`which means`），不要反复用 `So`。`And` 仅在真正表示并列时使用。
+- **碎句合并为完整语义单位：** 演讲者会把一个完整意思拆成多个碎句（"All of our pivot joints" / "or jiggle joint updates" / "their position updates"），字幕中应合并为一个完整句子（"All position updates for the pivot joints and jiggle joints"）。如果原文是多个短句表达一个完整意思，合并为一个句子，不要用 `and` 机械连接断句。
+- **主语要明确：** 技术讲解字幕中，避免用 `I` 指代演讲者（逐字转录感太强）。用 `we`（泛指开发者/我们）或直接用技术概念做主语。被动语态要确保主语明确。如 `when I'm working with this data` → `When working with this system`。
+- **公式推导的连贯性：** 解释公式时，变量定义、中间步骤、最终结论要形成完整链条。不要在一条里只说一半（如"x is our rest"），下一条才补全。每条字幕应包含一个完整的逻辑步骤。
+- **数字、单位与公式：** 数字保持原值；度量单位保留英文（如 `6 inches`），必要时保留原文已有的换算；版本号、分辨率、货币保持原值。公式与物理符号原样保留，如 `F = -k(p - т)`、`F = -k(p-т) - μV`、`x = p - r`、`a = -k/m * x - μ/m * v`、`Hooke's Law`、`Simple Harmonic Motion`、`Damped Harmonic Motion`、`Semi-Implicit Euler Integrator`、`Explicit Euler`、`RK4`、`ODE`。公式中指数必须准确（`dt²` 不能写成 `dt`），变量用标准符号（`μ` 不写 `mu`）。
 - **代码与路径：** 代码、路径、URL、公式内部不译不改，保留原文。
 - **行长与单行（英文专用，替代中文 ≤18 字）：** **严格单行，严禁换行。** 单行尽量控制在合理长度（理想 ≤42 字符，最长建议 ≤60 字符），超出时通过精简改写而非换行解决。不得为凑字数在句内插入换行符。时间短的条目进一步缩短。
 - **标点：** 英文允许必要的 `, . ? !`，但保持轻量（便于快读）。不用中文标点，不堆砌分号/破折号。句末标点可省略以求干净，问句保留 `?`。
@@ -128,6 +144,13 @@
 - [ ] 软件/院校/代码保持英文原名，未音译
 - [ ] 留学术语已按 §二.4 统一英文
 - [ ] 已用 LLM 重写，**未使用 Google/机器直译**
+- [ ] **逐条语义验证：** 已逐条核验英文译文与中文原文的语义对应关系，确保内容未错位、未跳条、未遗漏；特别是时间码跳跃处（如静音段前后的序号）已检查语义连贯
 - [ ] 口癖已精简，译文简洁口语化、无中文残留
 - [ ] 全片严格单行（无句内换行），标点轻量
 - [ ] 无 Markdown、无译注、无空条目、无中文字符
+- [ ] **填充词已删除：** `you can think of it as`、`what is X`、`the thing about it is` 等口语铺垫已清除，每条直接给结论或陈述
+- [ ] **数学术语精确：** 变量先定义再使用，μ 不写 mu，dt² 不写 dt，ODE 不写成 PDE，displacement 不写 rest/length
+- [ ] **术语统一：** damping force 不交替用 friction force，stiffness/damping 全文一致
+- [ ] **碎句已合并：** 多个短句表达一个完整意思时已合并为完整句子，无 `and` 机械连接断句
+- [ ] **主语明确：** 避免 `I` 指代，用 `we` 或技术概念做主语
+- [ ] **连接词不堆叠：** 未反复用 `So`/`And` 开头，逻辑关系通过句子内容传达
