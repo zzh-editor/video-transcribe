@@ -166,11 +166,18 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --language zh \
   --no-vad
 
-# 自定义断句停顿阈值（默认 300ms 中文 / 500ms 英文）
+# 自定义断句停顿阈值（本地中文 300ms / 英文 500ms，Groq 150ms；--pause-ms 两引擎均生效）
 venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --output "<output_dir>/tmp/raw.srt" \
   --language zh \
   --pause-ms 500
+
+# Groq 专用：对所有段强制评分重切（默认仅异常段 + 含 ≥0.80s 词隙的正常段；A/B 对比时临时开启，需验证）
+venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
+  --output "<output_dir>/tmp/raw.srt" \
+  --language zh \
+  --engine groq --groq-api-key "$API_KEY" \
+  --full-segment
 
 # 导出带 word 时间戳的 segments（启用 L3 语义断句复核时使用，见 Step 3 后检查点）
 venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
@@ -224,11 +231,13 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 
 **Groq 路径**走 `groq_word_adapter.refine_groq_segments()`：取顶层字符级 words，对齐 segment 文本后经 jieba 聚合为词组，仅对超限 segment 复用 `_segment_words()` 评分。本地路径不变。
 
-也可独立调用仅做诊断验证：
+也可独立调用（仅做英文残片合并与空段过滤，不重做 word-level 评分断句）：
 
 ```bash
 venv/bin/python3 scripts/refine_segments.py "<output_dir>/tmp/raw.srt"
 ```
+
+> 独立运行不具备 word timestamps，仅走 `_merge_fragments` 与空段过滤；如需验证评分断句能力，请走 `transcribe.py --export-refined` 的内存流水线。
 
 输出覆盖 `raw.srt`（时间轴无损）。算法细节见附录「断句算法」。
 
@@ -372,48 +381,78 @@ grep -c '^[0-9]\+$' "tmp/final.srt"
 验证通过 → 读取前 5 条字幕在对话中展示给用户预览原文内容。
 验证失败（空文件/无有效条目）→ 回到 Step 3 重跑 refine+cleanup，如重试后仍无效则报错终止。
 
-### 2. 语种判断与翻译决策
+### 2. 语种判断与翻译决策（含双向路由）
 
-从 Whisper 输出中获取检测语种并告知用户（同时展示预览片段）。
+从 Whisper 输出中获取检测语种并告知用户（同时展示预览片段）。**翻译前必须先判定方向，再加载对应行业规则文件：**
 
-语种为 `zh` → 自动跳过翻译，进入 Step 7。
+- **源语言为中文（`zh`）且用户需要英文字幕** → 加载 `docs/游戏留学SRT翻译规则_中译英.md`（中译英专用）。**用 Question 工具弹窗询问用户：**
+  - header: "选择翻译模式"
+  - description: "将中文字幕翻译为英文（游戏留学场景，默认全英、去括号）"
+  - options:
+    - label: "纯英文字幕" → description: "仅输出英文翻译（默认全英，去除中文括注）"
+    - label: "英上中下" → description: "英文在上，中文在下"
+    - label: "中上英下" → description: "中文在上，英文在下"
+    - label: "不需要翻译" → description: "保留原文 SRT"
+  - multiple: false
 
-语种非中文 → **用 Question 工具弹窗询问用户：**
-- header: "选择翻译模式"
-- description: "将字幕翻译为中文"
-- options:
-  - label: "纯中文字幕" → description: "仅输出中文翻译"
-  - label: "中上原下" → description: "中文在上，原文在下"
-  - label: "原上中下" → description: "原文在上，中文在下"
-  - label: "不需要翻译" → description: "保留原文 SRT"
-- multiple: false
+- **源语言为非中文（`en` / 其他）且用户需要中文字幕** → 加载 `docs/游戏留学SRT翻译规则.md`（英译中专用）。**用 Question 工具弹窗询问用户：**
+  - header: "选择翻译模式"
+  - description: "将字幕翻译为中文（游戏留学场景，中文优先+英文括注）"
+  - options:
+    - label: "纯中文字幕" → description: "仅输出中文翻译"
+    - label: "中上原下" → description: "中文在上，原文在下"
+    - label: "原上中下" → description: "原文在上，中文在下"
+    - label: "不需要翻译" → description: "保留原文 SRT"
+  - multiple: false
+
+- **用户已在提示中明确指定方向**（如“翻成英文”“中翻英”“英译中”）→ 以用户指定为准，直接加载对应文件，不再按自动语种覆盖。
+
+> 方向判定后，后续 Step 6 必须严格按对应文件执行；不可混用两套规则。
 
 ## Step 6: [可选] 翻译
 
 AI（当前会话的 LLM）直接逐段翻译，不调用外部翻译 API。
-逐段读取 `tmp/final.srt` 中的文本，按用户选择的模式生成对应格式，
-严格保留原始时间戳，每行中文字幕不超过 18 个字符并按语义断点拆分。
+逐段读取 `tmp/final.srt` 中的文本，按用户选择的模式生成对应格式，严格保留原始时间戳。
 
 翻译时遵循以下规则，优先级从高到低：
 
-### 基线规则（始终适用）
+### 基线规则（始终适用，按输出语言区分）
 
+**输出为中文时：**
 1. 每行 ≤18 个中文字符，按语义断点拆分
-2. 去标点
+2. 去标点（书名号《》、术语括注 `()` 例外）
 3. 中英文间加空格
 4. 专有名词保留英文
 5. 自然口语化
 6. 严格保留时间戳
 
-### 行业补充指南
+**输出为英文时：**
+1. 每行 ≤42 字符（含空格），按英文语义断点拆分，单条最多两行
+2. 允许必要英文标点 `, . ? !`，保持轻量，不用中文标点
+3. 中英文/数字间保留自然空格
+4. 专有名词/代码/公式保留英文原样
+5. 自然口语化、简洁
+6. 严格保留时间戳
 
-游戏美术 / 3D 制作 / 绑定方向的非中文内容翻译，参见技能目录下的 `docs/游戏留学SRT翻译规则.md`。该文件作为基线规则的行业特化补充，包含术语处理、ASR 术语误识别修正等详细规则。当两者冲突时，以基线规则为准。
+### 行业补充指南（双向，按方向加载）
+
+- **英译中（非中文 → 中文）**：游戏美术 / 3D 制作 / 绑定 / 游戏留学方向，参见 `docs/游戏留学SRT翻译规则.md`。该文件为**英译中专用**，含术语中文优先+首次括注英文、ASR 误识别修正、留学高频词表等。当与基线冲突时，以基线为准。
+- **中译英（中文 → 英文）**：中文课堂/分享类字幕译为英文时，参见 `docs/游戏留学SRT翻译规则_中译英.md`。该文件为**中译英专用**，由英译中镜像倒推，核心是**英文优先、全英输出、去除所有 `中文(英文)` / `英文(中文)` 括注、拼写纠正（如 jointt→joint）、行长 ≤42 字符**。当与基线冲突时，以基线为准。
+
+> **执行要求：** 判定方向后必须在对话中声明已加载哪一份规则文件，并按该文件的 §二 术语处理与 §三 可读性逐条执行。翻译 SRT 字幕时，所有“括注剥离/添加”操作必须按对应文件的 §二.1 执行。
 
 ### 翻译模式
 
+**英译中：**
 1. 纯中文字幕
 2. 中上原下（中文在上，原文在下）
 3. 原上中下（原文在上，中文在下）
+4. 不需要翻译
+
+**中译英：**
+1. 纯英文字幕（默认全英，去中文括注）
+2. 英上中下（英文在上，中文在下）
+3. 中上英下（中文在上，英文在下）
 4. 不需要翻译
 
 ## Step 7: 输出
@@ -488,7 +527,7 @@ fi
 
 ### 中文分词（Groq 模式必需）
 - **jieba==0.42.1**：`venv/bin/pip install jieba==0.42.1`（MIT，约 19 MB，自定义词典支持）
-- 领域词典：`data/jieba_domain_dict.txt`（UTF-8 userdict 格式，每行 `词语 词频 词性`）
+- 领域词典：`data/jieba_domain_dict.txt`（UTF-8 userdict 格式，每行 `词语 词频 词性`；未找到时降级为默认词典并打印 warning）
 
 ### 本地模型优化（可选，失败自动降级）
 - **silero-vad-notorch**（macOS 长音频 VAD 预分片）：`venv/bin/pip install silero-vad-notorch`
@@ -646,8 +685,12 @@ AI 处理完成后可清理 `tmp/` 目录。
 
 cleanup_segments.py
   ├── 去空文本段（text.strip() == "" 直接删除，与 refine 的 `_clean_segments` 冗余兜底）
-  ├── 幻觉检测（`_is_repeat_loop`：极低字符复现率/超短词汇表的 loop 判定 + 已知幻觉黑名单）
-  └── 合并相邻重复段（VAD 边界重叠或 refine 切分后不区分大小写完全相同的相邻 segment）
+  ├── 幻觉检测（四规则并联，任一命中即删）：
+  │     ├── `_is_repeat_loop`：极低字符复现率/超短词汇表的 loop 判定
+  │     ├── `_is_known_hallucination`：黑名单（支持空格归一化匹配）
+  │     ├── `_is_dense_hallucination`：密度判定（≥15 字且时长 <1.0s 时字速 ≥15 字/s → 幻觉）
+  │     └── `_is_no_speech_hallucination`：质量指标判定（Groq verbose_json 返回的 `no_speech_prob ≥0.8` 且 `avg_logprob ≤-1.0` 时判定静默段幻觉，缺指标则跳过）
+  └── 合并相邻重复段（仅当文本不区分大小写相同且 `gap = cur.start - prev.end ≤ 1.0s` 时合并，跨远距重复保留）
 
 两阶段分工：预清洗处理 ASR 噪声（空/零时长），后清洗处理 VAD 边界重叠和幻觉。
 
