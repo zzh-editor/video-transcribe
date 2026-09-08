@@ -179,11 +179,13 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --engine groq --groq-api-key "$API_KEY" \
   --full-segment
 
-# 导出带 word 时间戳的 segments（启用 L3 语义断句复核时使用，见 Step 3 后检查点）
+# 默认每次转录都会生成带 word 时间戳的 JSON：<输出srt>.words.json
+# （如 tmp/raw.srt → tmp/raw.srt.words.json）。L3 语义断句复核直接读取该文件，
+# 无需重新转录。--export-refined 仅用于覆盖默认路径：
 venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --output "<output_dir>/tmp/raw.srt" \
   --language zh \
-  --export-refined "<output_dir>/tmp/refined_segments.json"
+  --export-refined "<output_dir>/tmp/custom_words.json"
 ```
 
 脚本特性：
@@ -237,7 +239,7 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 venv/bin/python3 scripts/refine_segments.py "<output_dir>/tmp/raw.srt"
 ```
 
-> 独立运行不具备 word timestamps，仅走 `_merge_fragments` 与空段过滤；如需验证评分断句能力，请走 `transcribe.py --export-refined` 的内存流水线。
+> 独立运行不具备 word timestamps，仅走 `_merge_fragments` 与空段过滤；如需验证评分断句能力，请走 `transcribe.py` 的内存流水线（每次转录默认输出 `<output>.words.json`）。
 
 输出覆盖 `raw.srt`（时间轴无损）。算法细节见附录「断句算法」。
 
@@ -258,32 +260,53 @@ venv/bin/python3 scripts/cleanup_segments.py "<output_dir>/tmp/raw.srt"
 
 ## 🔴 CHECKPOINT 🛑 STOP: 语义断句复核（L3，可选）
 
-refine 的评分引擎是启发式断句。若要达到人工精校的断句质量（在语义小句边界切分，如动宾后/主语后/语义起始词前），需 Agent 用 LLM 复核。此步不写脚本，由 Agent 直接判断。
+refine 的评分引擎是启发式断句。若要达到人工精校的断句质量（在语义小句边界切分，如动宾后/主语后/语义起始词前），需 Agent 用 LLM 复核，由 `scripts/semantic_review.py` 分离「切分点安全性」和「时间戳」逻辑，LLM 只从安全断点里选语义合适的。
 
-1. 转写命令需加 `--export-refined "<output_dir>/tmp/refined_segments.json"`（见 Step 2），导出带 word 时间戳的 segments
+1. 转写已默认生成带 word 时间戳的 segments JSON（`<输出srt>.words.json`，见 Step 2），直接读取，无需重新转录；除非想换路径，否则不用传 `--export-refined`
 2. **用 Question 工具弹窗询问用户：**
    - header: "语义断句复核"
    - description: "是否启用 LLM 语义断句复核？耗时增加，但断句质量接近人工精校（每段约 8-18 字、在小句边界切分）"
    - options:
-     - label: "启用" → description: "Agent 读取 refined_segments.json，用 LLM 判断断点，写回 raw.srt"
+     - label: "启用" → description: "运行 semantic_review.py，Agent 在安全断点内选语义断点，写回 raw.srt"
      - label: "跳过" → description: "保留评分引擎断句结果"
    - multiple: false
 
 启用时执行：
 
-**判定标准** — 仅对以下存疑段复核，正常段跳过：
-- 去空白 ≥16 字符且无任何标点/停顿
-- 时长 >4s
-- 文本含残片迹象（短段拼入相邻段后更像词）
+**Step A — 生成候选与安全断点（确定性，无 LLM）**：
 
-**处理步骤**：
-1. 读 `tmp/refined_segments.json`，筛选存疑段
-2. 用 LLM 判断语义断点：在小句边界切（动宾后/主语后/同位语前/语义起始词如"因为/那/你/这种"之前），每段 8-18 字
-3. 按 words 时间戳精确切分：断点落在某 word 的 `start`，新段从该 word 开始；多段时按序重建 start/end/text
-4. 若某段的 words 缺失或时间戳不全，跳过该段（不臆造时间轴）
-5. 将切分结果写回 `tmp/raw.srt`（重新编号），并告知用户调整前后段数
+```bash
+cd <video-transcribe 技能目录>
+venv/bin/python3 scripts/semantic_review.py "<output_dir>/tmp/raw.srt.words.json" "<output_dir>/tmp/raw.srt" -o "<output_dir>/tmp/splits.json"
+```
 
-不满足判定标准或用户选择跳过 → 保持评分引擎结果。
+脚本自动处理（无需 Agent 手动对齐）：
+- **候选段筛选**：去空白 ≥16 字符且无标点的段 / 时长 >4s 的段 / 纯英残片段（≤3 字母）
+- **字符对齐** `_align_chars`：贪心游走 text ↔ words，容忍 Groq 的错序/错切（如 `感觉好吧 → 感+好吧+觉`）
+- **安全断点** `_safe_boundaries`：
+  - 中文断点只落在 jieba 词边界（`jieba.tokenize(mode='search')`），避免切断「做树/感觉」这类词
+  - 英文断点不得落在 `[A-Za-z0-9._+\-#&/]+` token 内部（不切 smooth/modular/Mouse Shader）
+  - 中-英 / 英-中 / 标点边天然安全
+- **words 时间戳缺失时按换行断**：Groq 约 40% 段 words 为空但 text 自带 `\n`（自然停顿边界），脚本按字符比例均分时间生成断点（`time_mode="proportional"`），此类段也可切，不再因 `time_reliable=false` 整段跳过
+- 标记 `time_reliable`（覆盖率 ≥90% + 时序单调）；输出 splits.json（每段含 text/reason/time_reliable/safe_cuts[]/selected_cuts[]）
+
+**Step B — LLM 选断点并写回**：
+
+1. 读 splits.json，仅处理 `time_reliable=true` 的候选段
+2. 用 LLM 判断语义断点：只在 `safe_cuts` 里选（每项含 `char`/`boundary`/`start`/`end`），在小句边界切（动宾后/主语后/同位语前/语义起始词如"因为/那/你/这种"之前），每段 8-18 字
+3. 将选中 char 填入该段的 `selected_cuts` 数组，其他段留空
+4. 写回：
+
+```bash
+venv/bin/python3 scripts/semantic_review.py "<output_dir>/tmp/splits.json" "<output_dir>/tmp/raw.srt" --apply -o "<output_dir>/tmp/refined.srt"
+```
+
+脚本校验每个 cut 在安全断点内、时间单调，重建时间轴重新编号写为 `refined.srt`（若全部无选中则与 raw.srt 内容一致）。校验后 `cp refined.srt raw.srt` 作为新基线，并告知用户调整前后段数。
+
+- 不臆造时间轴：words 缺失且无换行的段保持 `time_reliable=false`，不做比例切分
+- 不满足判定标准或用户选择跳过 → 保持评分引擎结果。
+
+**注意**：运行需在技能目录下用 `venv/bin/python3`（jieba 依赖）。semantic_review 的 apply 只处理 `selected_cuts` 非空的段，不含 `selected_cuts` 的段原样保留。
 
 ## 🔴 CHECKPOINT 🛑 STOP: 润色确认
 

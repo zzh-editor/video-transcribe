@@ -7,9 +7,12 @@ uses jieba to aggregate into phrase-level timed units, then applies the
 existing scoring engine only to abnormal (overlong/overduration) segments.
 """
 
+import math
+import struct
 import sys
 import unicodedata
 import warnings
+import wave
 from pathlib import Path
 
 from refine_segments import (
@@ -32,6 +35,20 @@ _PUNCT = frozenset("，、。？！；：,.;:!?…\u201c\u201d\u2018\u2019\u300c
 _SILENT_PAD_S = 0.2            # keep a small pad beyond speech
 _MIN_SILENT_SHRINK_S = 0.8     # only shrink when we save >= 0.8s
 _SILENT_RATIO_THRESHOLD = 0.4  # speech span / segment duration below this = bloated
+
+# ── Audio-energy shrinkage for word-less segments ─────────────────────
+# Groq words are missing for ~39% of segments (W6单元1). Those segment
+# windows swallow leading silence (start == prev end, seamless), which the
+# 人工精校版 splits out by listening for pauses. When audio_path is given
+# we fall back to an RMS energy profile: pick the speech block that follows
+# the longest silence (the main utterance), then move start to it. The
+# trailing edge of word-less windows is already accurate in practice, so we
+# only touch the start.
+_ENERGY_FRAME_S = 0.04         # RMS window/hop in seconds
+_ENERGY_MIN_BLOCK_S = 0.12     # a speech run must last this long to count
+_ENERGY_MERGE_GAP_S = 0.5      # blocks closer than this are one utterance
+_ENERGY_LEAD_PAD_S = 0.25      # keep a small pad before speech onset
+_ENERGY_ABS_THRESHOLD = 500.0  # RMS floor below which is noise
 
 # ── Silence-triggered split ────────────────────────────────────────────
 # Normal (non-abnormal) segments were previously kept as-is even when they
@@ -340,6 +357,129 @@ def _max_internal_gap(seg_words: list[dict]) -> float:
 
 def _has_large_pause(seg_words: list[dict], threshold: float = _SILENCE_SPLIT_GAP_S) -> bool:
     return _max_internal_gap(seg_words) > threshold
+
+
+class _AudioEnergy:
+    """Lazy per-window RMS reader over a WAV file, used to recover speech
+    boundaries for segments that have no word timestamps."""
+
+    def __init__(self, audio_path: str):
+        self._wf = wave.open(audio_path, "rb")
+        self._rate = self._wf.getframerate()
+        self._width = self._wf.getsampwidth()
+        self._channels = self._wf.getnchannels()
+        self._frame_len = self._width * self._channels
+
+    def profile(self, t0: float, t1: float) -> list[tuple[float, float]]:
+        """(time, RMS) every _ENERGY_FRAME_S within [t0, t1]."""
+        step = _ENERGY_FRAME_S
+        hop_frames = max(1, int(step * self._rate))
+        win_frames = max(1, int(step * self._rate))
+        pos_frames = int(t0 * self._rate)
+        out = []
+        t = t0
+        while t < t1 and pos_frames * self._frame_len < self._wf.getnframes() * self._frame_len:
+            self._wf.setpos(pos_frames)
+            raw = self._wf.readframes(win_frames)
+            if not raw:
+                break
+            if self._width == 2:
+                vals = struct.unpack(f"<{len(raw)//2}h", raw)
+            elif self._width == 1:
+                vals = tuple(b - 128 for b in raw)
+            else:
+                break
+            n_chunk = len(vals) // self._channels
+            if n_chunk > 0:
+                s = 0.0
+                for ch in range(self._channels):
+                    ch_vals = vals[ch::self._channels]
+                    s += sum(v * v for v in ch_vals) / n_chunk
+                rms = math.sqrt(s / self._channels)
+                out.append((t, rms))
+            pos_frames += hop_frames
+            t += step
+        return out
+
+    def speech_clusters(self, t0: float, t1: float) -> list[tuple[float, float]]:
+        """Consecutive above-threshold frames merged into speech clusters."""
+        prof = self.profile(t0, t1)
+        if not prof:
+            return []
+        peak = max(v for _, v in prof)
+        noise = min(v for _, v in prof)
+        if peak <= 0:
+            return []
+        thr = max(noise * 3.0, _ENERGY_ABS_THRESHOLD, peak * 0.10)
+        blocks: list[tuple[float, float]] = []
+        start_i = None
+        for i, (t, v) in enumerate(prof):
+            if v >= thr:
+                if start_i is None:
+                    start_i = i
+            elif start_i is not None:
+                if (i - start_i) * _ENERGY_FRAME_S >= _ENERGY_MIN_BLOCK_S:
+                    blocks.append((prof[start_i][0], prof[i - 1][0] + _ENERGY_FRAME_S))
+                start_i = None
+        if start_i is not None and (len(prof) - start_i) * _ENERGY_FRAME_S >= _ENERGY_MIN_BLOCK_S:
+            blocks.append((prof[start_i][0], prof[-1][0] + _ENERGY_FRAME_S))
+        clusters: list[tuple[float, float]] = []
+        for b in blocks:
+            if clusters and b[0] - clusters[-1][1] < _ENERGY_MERGE_GAP_S:
+                clusters[-1] = (clusters[-1][0], max(clusters[-1][1], b[1]))
+            else:
+                clusters.append(b)
+        return clusters
+
+    def close(self):
+        try:
+            self._wf.close()
+        except Exception:
+            pass
+
+
+def _main_speech_cluster(clusters: list[tuple[float, float]], seg_start: float) -> tuple[float, float] | None:
+    """Pick the speech cluster that follows the longest silence gap.
+
+    A cluster glued to the window start usually belongs to the previous
+    segment's trailing voice (word-less windows are seamless with `prev_end`),
+    so the main utterance is the one preceded by the most silence.
+    """
+    if not clusters:
+        return None
+    if len(clusters) == 1:
+        return clusters[0]
+    best = clusters[0]
+    best_gap = -1.0
+    prev_end = seg_start
+    for c in clusters:
+        gap = c[0] - prev_end
+        if gap > best_gap:
+            best = c
+            best_gap = gap
+        prev_end = max(prev_end, c[1])
+    return best
+
+
+def _shrink_wordless_start(seg: dict, energy: _AudioEnergy,
+                           min_lead: float = _ENERGY_LEAD_PAD_S) -> dict:
+    """Move a word-less segment's start to the onset of its main speech
+    block, so the inter-segment pause reappears instead of being swallowed.
+    The trailing edge is left untouched (it is accurate in practice)."""
+    seg_start = seg.get("start", 0)
+    seg_end = seg.get("end", 0)
+    if seg_end - seg_start <= min_lead * 2:
+        return seg
+    clusters = energy.speech_clusters(seg_start, seg_end)
+    main = _main_speech_cluster(clusters, seg_start)
+    if main is None:
+        return seg
+    onset = main[0] - min_lead
+    if onset <= seg_start or onset >= seg_end - min_lead:
+        return seg
+    out = dict(seg)
+    out["start"] = onset
+    return out
 
 
 def _shrink_silent_edges(seg: dict, seg_words: list[dict]) -> dict:
@@ -812,6 +952,7 @@ def refine_groq_segments(
     max_line_ms: int = 3000,
     pause_threshold: float = 0.3,
     full_segment: bool = False,
+    audio_path: str | None = None,
 ) -> list[dict]:
     """Refine Groq segments.
 
@@ -822,11 +963,15 @@ def refine_groq_segments(
     - Normal segments that internally contain a large word gap (>0.8s) are
       force-split via the scoring engine — these are the 19 silence-spanning
       cases (2-16s gaps) that previously became double-length subtitles.
+    - Segments WITHOUT word timestamps keep their window untouched except,
+      when ``audio_path`` is provided, their start is pulled back to the
+      main speech cluster so swallowed inter-segment silence reappears.
     - When ``full_segment`` is True every segment WITH usable word timestamps
       is passed through the scoring engine (not just abnormal ones).
     - Finally, runs of adjacent tiny crumbs are merged back together and
       overlaps are repaired.
     """
+    energy = _AudioEnergy(audio_path) if audio_path else None
     # Pre-merge English phrase split across Groq windows (e.g. Rookie / Awards)
     # before per-segment abnormal handling, so the phrase is kept together and
     # the combined window is split with proper Chinese breaks.
@@ -843,7 +988,10 @@ def refine_groq_segments(
         seg_words = assigned[seg_idx]
         has_content_words = bool(seg_words)
         if not has_content_words:
-            out.append(seg)
+            if energy is not None:
+                out.append(_shrink_wordless_start(seg, energy))
+            else:
+                out.append(seg)
             continue
         if not _is_abnormal(seg, max_chars, max_line_ms):
             if full_segment:
@@ -919,6 +1067,8 @@ def refine_groq_segments(
             shrunk.append(seg)
     # De-overlap again after shrink — final mutation exit
     final = _deoverlap(shrunk)
+    if energy is not None:
+        energy.close()
     if not _verify_segments_integrity(final, "final"):
         print("warning: final deoverlap integrity check failed", file=sys.stderr)
     return final

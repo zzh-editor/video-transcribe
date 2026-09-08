@@ -422,7 +422,9 @@ def main():
     parser.add_argument("--no-vad", action="store_true", default=None,
                         help="disable VAD pre-splitting")
     parser.add_argument("--export-refined", default=None, metavar="PATH",
-                        help="export refined segments (with word timestamps) as JSON")
+                        help="export refined segments (with word timestamps) as JSON. "
+                             "Default: <output>.words.json is always written, this flag "
+                             "overrides the path.")
 
     args = parser.parse_args()
 
@@ -481,6 +483,7 @@ def main():
                 max_line_ms=args.max_line_ms,
                 pause_threshold=groq_pause,
                 full_segment=args.full_segment,
+                audio_path=str(audio_path),
             )
             if len(segments) != before:
                 print(f"groq_word_adapter: {before} → {len(segments)} segments "
@@ -501,8 +504,12 @@ def main():
             pass
         except Exception:
             print("cleanup_segments error, skipping", file=sys.stderr)
-        if args.export_refined:
-            export_refined_json(segments, args.export_refined)
+        # Always export word-timestamps JSON so L3 re-segmentation needs no
+        # re-transcription. --export-refined overrides the default path.
+        export_refined_json(
+            segments,
+            args.export_refined or (str(output_path) + ".words.json"),
+        )
         write_srt(segments, output_path)
         print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
         return output_path
@@ -534,8 +541,12 @@ def main():
         vad=vad_enabled,
     )
 
-    if args.export_refined:
-        export_refined_json(segments, args.export_refined)
+    # Always export word-timestamps JSON so L3 re-segmentation needs no
+    # re-transcription. --export-refined overrides the default path.
+    export_refined_json(
+        segments,
+        args.export_refined or (str(output_path) + ".words.json"),
+    )
     write_srt(segments, output_path)
     print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
     return output_path

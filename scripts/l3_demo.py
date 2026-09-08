@@ -2,7 +2,7 @@
 """
 Simulate L3 LLM semantic re-segmentation demo.
 
-Reads refined_segments.json (exported by transcribe.py --export-refined),
+Reads the words JSON (auto-exported by transcribe.py as <output>.words.json),
 splits chosen segments at specified word indices, and writes a new SRT.
 Pure demonstration of what the Agent does manually in the L3 checkpoint.
 
