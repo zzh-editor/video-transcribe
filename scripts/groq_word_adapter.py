@@ -34,7 +34,9 @@ _PUNCT = frozenset("，、。？！；：,.;:!?…\u201c\u201d\u2018\u2019\u300c
 
 _SILENT_PAD_S = 0.2            # keep a small pad beyond speech
 _MIN_SILENT_SHRINK_S = 0.8     # only shrink when we save >= 0.8s
-_SILENT_RATIO_THRESHOLD = 0.4  # speech span / segment duration below this = bloated
+_SILENT_RATIO_THRESHOLD = 0.55  # speech span / segment duration below this = bloated
+                               # 0.4 太严：语音只占 40-55% 的段被当作"占比合理"保留整段
+                               # 静音，导致上一句字幕尾巴贴着下一句开头（时间轴连一起）
 
 # ── Audio-energy shrinkage for word-less segments ─────────────────────
 # Groq words are missing for ~39% of segments (W6单元1). Those segment
@@ -49,6 +51,10 @@ _ENERGY_MIN_BLOCK_S = 0.12     # a speech run must last this long to count
 _ENERGY_MERGE_GAP_S = 0.5      # blocks closer than this are one utterance
 _ENERGY_LEAD_PAD_S = 0.25      # keep a small pad before speech onset
 _ENERGY_ABS_THRESHOLD = 500.0  # RMS floor below which is noise
+_GLOBAL_NOISE_PCT = 5          # whole-file energy percentile treated as noise floor
+_GLOBAL_PEAK_PCT = 95          # whole-file energy percentile treated as speech peaks
+_GLOBAL_DOWNSAMPLE = 4         # global energy scan hop in units of _ENERGY_FRAME_S
+_SMOOTH_K = 3                  # median filter width (frames) before thresholding
 
 # ── Silence-triggered split ────────────────────────────────────────────
 # Normal (non-abnormal) segments were previously kept as-is even when they
@@ -62,7 +68,8 @@ _SILENCE_SPLIT_GAP_S = 0.80   # word gap > this inside a normal segment → spli
 # 4 overlapping segments were observed in Enhance output (279-500ms). Groq
 # windows overlap; post-processing can leave start < prev_end. A final
 # de-overlap trims prev end at cur start.
-_OVERLAP_EPS_S = 0.02  # keep 20ms gap after trim
+_OVERLAP_EPS_S = 0.15  # keep 150ms gap after trim so adjacent subtitles
+                       # do not feel glued together (20ms read as seamless)
 
 # ── Short-fragment merging ───────────────────────────────────────────
 _FRAGMENT_CHAR_LIMIT = 5       # candidate crumb segment: <= 5 visible chars
@@ -359,6 +366,22 @@ def _has_large_pause(seg_words: list[dict], threshold: float = _SILENCE_SPLIT_GA
     return _max_internal_gap(seg_words) > threshold
 
 
+def _median_smooth(points: list[tuple[float, float]], k: int = _SMOOTH_K) -> list[tuple[float, float]]:
+    """Median filter over the RMS series (k odd). Single-frame energy
+    glitches are pulled back, so onset/offset edges do not jitter."""
+    if k <= 1 or len(points) < 3:
+        return points
+    half = k // 2
+    vals = [v for _, v in points]
+    out = []
+    for i in range(len(points)):
+        lo = max(0, i - half)
+        hi = min(len(points), i + half + 1)
+        window = sorted(vals[lo:hi])
+        out.append((points[i][0], window[len(window) // 2]))
+    return out
+
+
 class _AudioEnergy:
     """Lazy per-window RMS reader over a WAV file, used to recover speech
     boundaries for segments that have no word timestamps."""
@@ -369,6 +392,66 @@ class _AudioEnergy:
         self._width = self._wf.getsampwidth()
         self._channels = self._wf.getnchannels()
         self._frame_len = self._width * self._channels
+        self._total_frames = self._wf.getnframes()
+        self._global_rms: list[float] | None = None
+
+    def _read_rms(self, frame_start: int, win_frames: int) -> float | None:
+        """RMS over `win_frames` PCM frames starting at `frame_start`."""
+        if frame_start >= self._total_frames:
+            return None
+        self._wf.setpos(frame_start)
+        raw = self._wf.readframes(win_frames)
+        if not raw:
+            return None
+        if self._width == 2:
+            vals = struct.unpack(f"<{len(raw)//2}h", raw)
+        elif self._width == 1:
+            vals = tuple(b - 128 for b in raw)
+        else:
+            return None
+        n_chunk = len(vals) // self._channels
+        if n_chunk <= 0:
+            return None
+        s = 0.0
+        for ch in range(self._channels):
+            ch_vals = vals[ch::self._channels]
+            s += sum(v * v for v in ch_vals) / n_chunk
+        return math.sqrt(s / self._channels)
+
+    def _global_profile(self) -> list[float]:
+        """Coarse whole-file RMS series (cached). The speech threshold is
+        derived from fixed percentiles across the whole file; a window-local
+        min/max (the old logic) drifts with loudness and background noise,
+        which made speech onset jitter from one segment to the next."""
+        if self._global_rms is not None:
+            return self._global_rms
+        step = _ENERGY_FRAME_S * _GLOBAL_DOWNSAMPLE
+        hop_frames = max(1, int(step * self._rate))
+        win_frames = max(1, int(_ENERGY_FRAME_S * self._rate))
+        vals: list[float] = []
+        pos = 0
+        while pos < self._total_frames:
+            rms = self._read_rms(pos, win_frames)
+            if rms is None:
+                break
+            vals.append(rms)
+            pos += hop_frames
+        self._global_rms = vals
+        return vals
+
+    def _threshold(self) -> float:
+        """Whole-file stable speech threshold from percentile anchors."""
+        vals = self._global_profile()
+        if not vals:
+            return _ENERGY_ABS_THRESHOLD
+        ordered = sorted(vals)
+
+        def _pct(q: int) -> float:
+            return ordered[min(len(ordered) - 1, len(ordered) * q // 100)]
+
+        noise = _pct(_GLOBAL_NOISE_PCT)
+        peak = _pct(_GLOBAL_PEAK_PCT)
+        return max(noise * 3.0, _ENERGY_ABS_THRESHOLD, peak * 0.10)
 
     def profile(self, t0: float, t1: float) -> list[tuple[float, float]]:
         """(time, RMS) every _ENERGY_FRAME_S within [t0, t1]."""
@@ -378,39 +461,22 @@ class _AudioEnergy:
         pos_frames = int(t0 * self._rate)
         out = []
         t = t0
-        while t < t1 and pos_frames * self._frame_len < self._wf.getnframes() * self._frame_len:
-            self._wf.setpos(pos_frames)
-            raw = self._wf.readframes(win_frames)
-            if not raw:
+        while t < t1 and pos_frames < self._total_frames:
+            rms = self._read_rms(pos_frames, win_frames)
+            if rms is None:
                 break
-            if self._width == 2:
-                vals = struct.unpack(f"<{len(raw)//2}h", raw)
-            elif self._width == 1:
-                vals = tuple(b - 128 for b in raw)
-            else:
-                break
-            n_chunk = len(vals) // self._channels
-            if n_chunk > 0:
-                s = 0.0
-                for ch in range(self._channels):
-                    ch_vals = vals[ch::self._channels]
-                    s += sum(v * v for v in ch_vals) / n_chunk
-                rms = math.sqrt(s / self._channels)
-                out.append((t, rms))
+            out.append((t, rms))
             pos_frames += hop_frames
             t += step
         return out
 
     def speech_clusters(self, t0: float, t1: float) -> list[tuple[float, float]]:
         """Consecutive above-threshold frames merged into speech clusters."""
-        prof = self.profile(t0, t1)
-        if not prof:
+        raw = self.profile(t0, t1)
+        if not raw:
             return []
-        peak = max(v for _, v in prof)
-        noise = min(v for _, v in prof)
-        if peak <= 0:
-            return []
-        thr = max(noise * 3.0, _ENERGY_ABS_THRESHOLD, peak * 0.10)
+        prof = _median_smooth(raw, _SMOOTH_K)
+        thr = self._threshold()
         blocks: list[tuple[float, float]] = []
         start_i = None
         for i, (t, v) in enumerate(prof):

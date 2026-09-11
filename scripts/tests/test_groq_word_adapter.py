@@ -1,15 +1,21 @@
 import json
+import os
+import struct
+import tempfile
 import unittest
+import wave
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from groq_word_adapter import (
+    _AudioEnergy,
     _assign_words_to_segments,
     _build_char_time_map,
     _check_coverage,
     _build_phrased_units,
+    _median_smooth,
     _protect_technical_tokens,
     _is_abnormal,
     _verify_text,
@@ -560,6 +566,58 @@ class TestAbsorbIsolatedCrumbs(unittest.TestCase):
         out = _absorb_isolated_crumbs(segs)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["text"], "对然后我们可以用到叫做cloudspeed")
+
+
+class TestAudioEnergy(unittest.TestCase):
+    """Energy detection uses a whole-file percentile threshold plus a
+    median-smoothed RMS series, so identical audio wins a consistent
+    speech/non-speech verdict regardless of the window being scanned."""
+
+    RATE = 16000
+
+    def _write_wav(self, path: str, data: bytes) -> None:
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self.RATE)
+            w.writeframes(data)
+
+    def _pcm(self, seconds: float, amp: int) -> bytes:
+        n = int(seconds * self.RATE)
+        return struct.pack(f"<{n}h", *(amp for _ in range(n)))
+
+    def _mixed_wav(self, tmp: str) -> str:
+        wav = os.path.join(tmp, "probe.wav")
+        self._write_wav(wav, self._pcm(2.0, 100) + self._pcm(1.0, 3000) + self._pcm(2.0, 100))
+        return wav
+
+    def test_speech_cluster_found_in_mixed_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            energy = _AudioEnergy(self._mixed_wav(tmp))
+            try:
+                clusters = energy.speech_clusters(0.0, 5.0)
+            finally:
+                energy.close()
+        self.assertEqual(len(clusters), 1)
+        onset, end = clusters[0]
+        self.assertGreater(onset, 1.5)
+        self.assertLess(onset, 2.6)
+        self.assertGreater(end, 2.8)
+        self.assertLess(end, 3.6)
+
+    def test_silence_window_stays_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            energy = _AudioEnergy(self._mixed_wav(tmp))
+            try:
+                clusters = energy.speech_clusters(0.0, 1.5)
+            finally:
+                energy.close()
+        self.assertEqual(clusters, [])
+
+    def test_median_smooth_drops_single_frame_glitch(self):
+        points = [(i * 0.04, v) for i, v in enumerate([100, 100, 4000, 100, 100])]
+        out = _median_smooth(points, 3)
+        self.assertLess(out[2][1], 200)
 
 
 if __name__ == "__main__":

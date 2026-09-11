@@ -350,7 +350,7 @@ def _find_split(text: str, char_pos: int, target_chars: int,
 
     # 1. Try punctuation (strong boundary)
     for c in range(end, max(char_pos, end - 6), -1):
-        if c > char_pos and text[c] in "，、。？！；：":
+        if char_pos < c < len(text) and text[c] in "，、。？！；：":
             return c + 1
 
     # 2. Try space backward (English word boundary) — skip spaces inside an
