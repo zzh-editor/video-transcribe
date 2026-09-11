@@ -68,6 +68,16 @@ class TestDenseHallucination(unittest.TestCase):
         seg = {"start": 0.0, "end": 2.0, "text": "请不吝点赞订阅转发打赏支持明镜与点点栏目"}
         self.assertFalse(_is_dense_hallucination(seg))
 
+    def test_english_fast_speech_not_flagged(self):
+        # Real rapid English: 16 chars / 0.79s = 20.3 chars/s — passes new EN bar (25)
+        seg = {"start": 0.0, "end": 0.79, "text": "find this blue dot."}
+        self.assertFalse(_is_dense_hallucination(seg))
+
+    def test_english_extreme_density_flagged(self):
+        # English extreme: 34 chars / 0.8s = 42.5 chars/s — still caught by EN bar (25)
+        seg = {"start": 0.0, "end": 0.8, "text": "The quick brown fox jumps over the lazy dog"}
+        self.assertTrue(_is_dense_hallucination(seg))
+
 
 class TestNoSpeechHallucination(unittest.TestCase):
     def test_both_metrics_flagged(self):

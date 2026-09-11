@@ -250,7 +250,9 @@ class TestRefineGroqSegments(unittest.TestCase):
             segments, [],
             max_chars=20, max_line_ms=4000,
         )
-        self.assertEqual(len(result), 1)
+        self.assertGreater(len(result), 1)
+        merged_text = "".join(r["text"] for r in result).replace(" ", "")
+        self.assertEqual(merged_text, segments[0]["text"].replace(" ", ""))
 
     def test_full_integration_with_fixture(self):
         words = self.fixture["words"]
@@ -286,7 +288,9 @@ class TestRefineGroqSegments(unittest.TestCase):
             segments, [],
             max_chars=20, max_line_ms=4000,
         )
-        self.assertEqual(len(result), 1)
+        self.assertGreater(len(result), 1)
+        merged_text = "".join(r["text"] for r in result).replace(" ", "")
+        self.assertEqual(merged_text, segments[0]["text"].replace(" ", ""))
 
 
 class TestSilentTailShrink(unittest.TestCase):

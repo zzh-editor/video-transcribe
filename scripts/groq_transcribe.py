@@ -294,6 +294,13 @@ def _transcribe_single(
     if not segments:
         print("error: no segments in Groq API response", file=sys.stderr)
         sys.exit(1)
+    if not words:
+        print("warning: Groq API returned no word-level timestamps; "
+              "segment boundaries will use raw Groq windows (~5s). "
+              "This degrades subtitle timestamp precision. "
+              "Consider using mlx-whisper or faster-whisper for word-level "
+              "timestamps, or check if Groq model supports word timestamps.",
+              file=sys.stderr)
     segments.sort(key=lambda s: s["start"])
     words.sort(key=lambda w: w["start"])
     return {"segments": segments, "words": words}

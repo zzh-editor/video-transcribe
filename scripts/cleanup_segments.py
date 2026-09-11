@@ -40,6 +40,18 @@ KNOWN_HALLUCINATIONS = frozenset({
 HALLUC_DURATION_S = 1.0       # only flag segments shorter than this
 HALLUC_MIN_CHARS = 15         # ... with at least this many visible chars
 HALLUC_MIN_CHARS_PER_SEC = 15.0  # ... at a density above this threshold
+# English sustains far higher char density than Chinese — ~15-25 chars/s at
+# natural fast speech (English words average ~5 chars). The 15 chars/s rule
+# wrongly flags rapid but real English (e.g. "find this blue dot." = 20 chars/s
+# in 0.79s). Latin-only segments get a higher bar; CJK keeps the tighter one.
+HALLUC_MIN_CHARS_PER_SEC_EN = 25.0  # Latin-only density bar (still catches >25/s)
+
+# Sparse-window hallucination rule (the mirror of density): a very long
+# segment carrying almost no text is Whisper inflating a single repeated
+# phrase (e.g. "谢谢大家") across a trailing silence window. Human speech
+# sustains ~4-8 chars/s, so a 30s window with 4 chars is a fabricated loop.
+SPARSE_DURATION_S = 20.0      # only flag segments longer than this
+SPARSE_MAX_CHARS_PER_SEC = 0.5  # ... with density below this (chars / second)
 
 # Groq verbose_json quality-metric hallucination rule. Whisper reports a high
 # no_speech_prob for silence-blocks it hallucinated text into; low avg_logprob
@@ -83,17 +95,49 @@ def _is_repeat_loop(text: str) -> bool:
     return False
 
 
+def _is_latin_text(text: str) -> bool:
+    """True when the segment is essentially Latin-script speech (English), i.e.
+    no CJK characters. Mixed bilingual segments keep the Chinese threshold."""
+    for ch in text:
+        if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
+            return False
+    return bool(text.strip())
+
+
 def _is_dense_hallucination(seg: dict) -> bool:
     """True when a very short segment carries an implausible amount of text,
-    i.e. text density far exceeds human speech rate."""
+    i.e. text density far exceeds human speech rate. The density bar is
+    language-aware: English sustains ~15-25 chars/s naturally, so Latin-only
+    segments use a higher threshold than Chinese (4-8 chars/s)."""
     text = seg.get("text", "").strip()
+    if not text:
+        return False
+    threshold = HALLUC_MIN_CHARS_PER_SEC_EN if _is_latin_text(text) else HALLUC_MIN_CHARS_PER_SEC
     chars = len(_normalize_text(text))
     if not chars or chars < HALLUC_MIN_CHARS:
         return False
     duration = (seg.get("end", 0) or 0) - (seg.get("start", 0) or 0)
     if duration <= 0 or duration > HALLUC_DURATION_S:
         return False
-    return chars / duration >= HALLUC_MIN_CHARS_PER_SEC
+    return chars / duration >= threshold
+
+
+def _is_sparse_hallucination(seg: dict) -> bool:
+    """True when a very long segment carries implausibly little text.
+
+    Whisper inflates a single repeated phrase (e.g. "谢谢大家") across a
+    trailing silence window, producing e.g. 4 chars over 30s. Real speech
+    sustains ~4-8 chars/s, so density far below that over a long window is
+    a fabricated loop, not a slow speaker.
+    """
+    text = seg.get("text", "").strip()
+    chars = len(_normalize_text(text))
+    if not chars:
+        return False
+    duration = (seg.get("end", 0) or 0) - (seg.get("start", 0) or 0)
+    if duration < SPARSE_DURATION_S:
+        return False
+    return chars / duration < SPARSE_MAX_CHARS_PER_SEC
 
 
 def _has_quality_metrics(seg: dict) -> bool:
@@ -137,6 +181,7 @@ def cleanup(segments: list[dict]) -> list[dict]:
                  if not _is_repeat_loop(s.get("text", ""))
                  and not _is_known_hallucination(s.get("text", ""))
                  and not _is_dense_hallucination(s)
+                 and not _is_sparse_hallucination(s)
                  and not _is_no_speech_hallucination(s)]
     if not non_empty:
         return []

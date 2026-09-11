@@ -78,6 +78,11 @@ _FRAGMENT_CHAR_LIMIT = 5       # candidate crumb segment: <= 5 visible chars
 # Use a generous gap for crumb runs (word-level when available, window-level
 # otherwise) so the sentence can be glued back together.
 _MERGE_CRUMB_GAP_S = 5.0
+# Boundary word span threshold for silence-fill detection. Groq's word
+# timestamps extend a word's span to fill silence up to the next word's
+# start, so a single CJK character can claim 7-17s. When a boundary
+# word's span exceeds this, the word gap is unreliable.
+_WORD_FILL_MAX_S = 2.0
 
 # ── Isolated crumb absorption ────────────────────────────────────────
 # A lone filler word (OK/然后/对, <=3 chars) can sit in a seconds-long silent
@@ -219,10 +224,14 @@ def _build_char_time_map(seg_text: str, groq_words: list[dict]) -> dict:
             groq_times.append((w["start"], w["end"]))
     text_no_ws = seg_text.replace(" ", "").replace("\u200b", "")
     norm_groq = unicodedata.normalize("NFKC", groq_concat)
+    # Only strip punctuation that is absent from the Groq words. English tokens
+    # like "dot.", "here.", "OK," carry their own punctuation, so ASCII
+    # punctuation that appears in norm_groq must stay in content_text to align.
+    _norm_char_set = set(norm_groq)
     content_positions = []
     punct_positions = []
     for i, ch in enumerate(text_no_ws):
-        if ch in _PUNCT:
+        if ch in _PUNCT and ch not in _norm_char_set:
             punct_positions.append(i)
         else:
             content_positions.append(i)
@@ -530,8 +539,12 @@ def _main_speech_cluster(clusters: list[tuple[float, float]], seg_start: float) 
 def _shrink_wordless_start(seg: dict, energy: _AudioEnergy,
                            min_lead: float = _ENERGY_LEAD_PAD_S) -> dict:
     """Move a word-less segment's start to the onset of its main speech
-    block, so the inter-segment pause reappears instead of being swallowed.
-    The trailing edge is left untouched (it is accurate in practice)."""
+    block and pull the end back to the trailing speech offset, so both the
+    swallowed leading and trailing silence reappear.
+    The start uses the main speech block (the one following the longest
+    silence, avoiding the previous segment's trailing voice); the end uses
+    the last speech block so no real speech is cut off.
+    """
     seg_start = seg.get("start", 0)
     seg_end = seg.get("end", 0)
     if seg_end - seg_start <= min_lead * 2:
@@ -545,6 +558,14 @@ def _shrink_wordless_start(seg: dict, energy: _AudioEnergy,
         return seg
     out = dict(seg)
     out["start"] = onset
+    # Tail shrink: trim trailing silence when the last speech block ends
+    # well before the window end (>= _MIN_SILENT_SHRINK_S saved avoids jitter).
+    last = clusters[-1]
+    trailing_saved = seg_end - last[1]
+    if trailing_saved >= _MIN_SILENT_SHRINK_S and last[1] + _SILENT_PAD_S < seg_end:
+        out["end"] = last[1] + _SILENT_PAD_S
+    if out["end"] <= out["start"]:
+        return seg
     return out
 
 
@@ -825,9 +846,13 @@ def _merge_english_phrase_segments(segments: list[dict]) -> list[dict]:
             trailing = _trailing_ascii(prev_text)
             leading = _leading_ascii(nxt_text)
             if gap <= 0.6 and trailing and leading:
+                # Don't merge across sentence boundaries: trailing terminal
+                # punctuation (.?!) signals the first segment is self-contained.
+                if trailing[-1] in ".!?":
+                    pass  # fall through to out.append(seg) below
                 # Check if merging keeps reasonable length and phrase is continuous speech
-                merged_text = prev_text + " " + nxt_text
-                if len(merged_text.replace(" ", "")) <= 60:
+                elif len((prev_text + " " + nxt_text).replace(" ", "")) <= 60:
+                    merged_text = prev_text + " " + nxt_text
                     merged = {
                         "start": seg["start"],
                         "end": nxt["end"],
@@ -902,7 +927,7 @@ def _attach_cn_particle(segments: list[dict]) -> list[dict]:
     return out
 
 
-def _merge_fragments_groq(segments: list[dict]) -> list[dict]:
+def _merge_fragments_groq(segments: list[dict], energy=None) -> list[dict]:
     """Merge runs of adjacent tiny segments (Groq splits a sentence into
     2-4 char crumbs spread across ~5s silence-bloated windows)."""
     if len(segments) < 2:
@@ -911,11 +936,35 @@ def _merge_fragments_groq(segments: list[dict]) -> list[dict]:
     def _crumb_gap(prev_seg: dict, nxt_seg: dict) -> float:
         """Distance between two candidate crumbs. Uses word timestamps when
         both sides carry them (speech-to-speech gap), otherwise falls back to
-        the window boundary gap."""
+        the window boundary gap. When boundary word spans are abnormally large
+        (silence-filled) or either side lost its words, anchors to energy
+        speech clusters instead — the fallback-split crumbs carry no words
+        and window boundaries are seamless (0 gap) even across real silence."""
         prev_words = prev_seg.get("words", [])
         nxt_words = nxt_seg.get("words", [])
         if prev_words and nxt_words:
-            return nxt_words[0]["start"] - prev_words[-1]["end"]
+            g = nxt_words[0]["start"] - prev_words[-1]["end"]
+            # Groq's word timestamps push word spans across silence. If a
+            # boundary word's span is far too long, the gap calculation is
+            # poisoned — fall back to energy-anchored speech gap.
+            if energy is not None and (
+                prev_words[-1]["end"] - prev_words[-1]["start"] > _WORD_FILL_MAX_S
+                or nxt_words[0]["end"] - nxt_words[0]["start"] > _WORD_FILL_MAX_S
+            ):
+                pc = energy.speech_clusters(prev_seg["start"], prev_seg["end"])
+                nc = energy.speech_clusters(nxt_seg["start"], nxt_seg["end"])
+                if pc and nc:
+                    g = max(g, nc[0][0] - pc[-1][1])
+            return g
+        if prev_words or nxt_words:
+            # One side lost its words (e.g. fallback-split crumbs). Window
+            # boundaries are seamless for Groq (next.start == prev.end), so
+            # the raw boundary gap is meaningless — trust energy if we have it.
+            if energy is not None:
+                pc = energy.speech_clusters(prev_seg["start"], prev_seg["end"])
+                nc = energy.speech_clusters(nxt_seg["start"], nxt_seg["end"])
+                if pc and nc:
+                    return nc[0][0] - pc[-1][1]
         return nxt_seg["start"] - prev_seg["end"]
 
     out: list[dict] = []
@@ -1090,7 +1139,7 @@ def refine_groq_segments(
         out.extend(_inherit_quality(seg, pieces))
     # Mutation exit 1: after merge fragments
     _merge_before = len(out)
-    out = _merge_fragments_groq(out)
+    out = _merge_fragments_groq(out, energy=energy)
     # Only merge English phrases when we have word timestamps to re-split
     # otherwise a no-word SRT merge (e.g. 10+21=31 chars) becomes super-long with no fallback
     if top_words:
@@ -1111,7 +1160,10 @@ def refine_groq_segments(
                     fb = _fallback_split(seg, max_chars, max_line_ms)
                     resplit.extend(_inherit_quality(seg, fb if fb else [seg]))
             else:
-                resplit.append(seg)
+                fb = _fallback_split(seg, max_chars, max_line_ms)
+                if energy is not None:
+                    fb = [_shrink_wordless_start(p, energy) for p in fb]
+                resplit.extend(_inherit_quality(seg, fb if fb else [seg]))
         else:
             resplit.append(seg)
     out = resplit
