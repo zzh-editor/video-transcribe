@@ -130,9 +130,17 @@ Whisper 模型在首次转写时自动下载至 `models/`。
 mkdir -p "<output_dir>/tmp"
 ```
 
-提取为 16kHz 单声道 WAV（Whisper 标准输入格式）：
+根据引擎选择提取方式：
+
+**本地模型 (engine=local)** — 提取为 16kHz 单声道 WAV（Whisper 标准输入格式）：
 ```bash
 ffmpeg -i "<input>" -vn -ar 16000 -ac 1 "<output_dir>/tmp/audio.wav"
+```
+
+**Groq API (engine=groq)** — **跳过 WAV 提取，直接把原始文件传给 transcribe.py**（如 mp3/m4a/flac/wav 均可）。`groq_transcribe.py` 会一步转成 16kHz 单声道 Opus/OGG 再上传，避免「先抽 16kHz WAV → 再转 OGG」的二次转换（对输入通常是 mp3 的情况，直接 MP3 → 16kHz mono OGG 单次转码，质量损失最小、上传体也小）：
+
+```bash
+cp "<input>" "<output_dir>/tmp/audio.src"   # 原样保留，交给脚本处理
 ```
 
 ## Step 2: 转写
@@ -203,7 +211,7 @@ import json, os
 p = os.path.expanduser('~/.config/opencode/skills/video-transcribe/config.json')
 print(json.load(open(p))['groq_api_key']
 )")
-venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
+venv/bin/python3 scripts/transcribe.py "<输出目录>/tmp/audio.src" \
   --output "<output_dir>/tmp/raw.srt" \
   --language zh \
   --engine groq \
@@ -211,7 +219,8 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 ```
 
 注意事项：
-- 音频文件不得超过 **25MB**（Groq 免费层限制），超过时提示用户改用本地模型
+- 脚本会统一把输入转成 **16kHz 单声道 Opus/OGG** 再上传（`groq_transcribe._compress_audio` 内置，libopus）。输入已是 16kHz mono OGG 且 ≤25MB 时零转换直传；其余任何格式（mp3/m4a/flac/wav，无论是否超 25MB）一律一步转成 OGG。**不要手动转 FLAC/MP3/wav 再喂脚本**，避免二次转换
+- 音频超过 **25MB** 也没关系：`_compress_audio` 按时长推码率（16-128kbps）保证落在限内，超限时自动减半码率重编 ≤3 次
 - 无需 VAD 分片（API 服务端处理）
 - words 为字符级（中文单字），通过 `groq_word_adapter.py` 用 jieba 聚合为词组后评分
 - 异常段（`char_count>max_chars` 或 `duration>max_line_ms`）必切；正常段若含 **≥0.80s 词隙**（`_SILENCE_SPLIT_GAP_S`）亦强制切（实测 19 处 1.5-16s 跨静默合并均需此）；否则仅做静默缩边（`_shrink_silent_edges` 缩首尾、`_SILENT_PAD_S=0.2s`）
@@ -584,7 +593,7 @@ AI 处理完成后可清理 `tmp/` 目录。
 | srt-enhancer 子步骤被跳过（未执行 domain detection 或 web calibration） | 回退到 Step 4 重新执行完整子步骤清单 | 跳过润色，以 raw.srt 为基线 |
 | AI 翻译执行失败（上下文超限/超时/输出格式异常） | 减小每批翻译量（每次 5 条 SRT 条目）、重试 | 跳过翻译，以未翻译的 final.srt 作为最终输出 |
 | 竖屏输出失败（vertical.py 报错/计划缺失） | 用 vertical.py 的 `--max-chars` 硬切回退 | 跳过竖屏输出，仍清理 tmp/ 并告知用户 |
-| Groq API 文件 >25MB | 提示用户改用本地模型或自行压缩音频 | 用 Question 询问是否切换本地模型 |
+| Groq API 文件 >25MB | 无需处理，直接传原始文件，`_compress_audio` 自动转 16kHz mono OGG 并按时长推码率降到限内 | 转码后仍超限 → 用 Question 询问是否切换本地模型 |
 | Groq API Key 无效 (401) | 提示检查 API Key | 用 Question 询问是否重新输入 Key |
 | Groq 网络超时 (600s) | 提示连接超时 | 建议切换本地模型 |
 | Groq 速率限制 (429) | 提示频率超限，稍后再试 | 建议切换本地模型 |
@@ -598,7 +607,7 @@ AI 处理完成后可清理 `tmp/` 目录。
 | Groq 输出时间重叠（实测 4 处 279-500ms，如 `100-112.5→101.8-102.6` 前段尾部压后段） | `_deoverlap()` 按 start 排序后 `prev.end = cur.start - 0.02s` 修正，二轮执行（合并后 + 终局缩边后） | 保持重叠（播放器取后段覆盖） |
 | Groq 段首尾静默膨胀（`ratio<0.4` 且首/尾各省 ≥0.8s，如 13s 窗口实际语音仅 1.1s） | `_shrink_silent_edges()` 双向缩至 `first_word.start-0.2s`/`last_word.end+0.2s`，合并后二轮缩边 | `_shrink_silent_tail` 仅缩尾（旧逻辑） |
 | Groq 对同一输入多次调用返回非确定段数（实测 137/163/172/282/269/524 不等） | 属 API 正常行为，重跑结果不同；段数差异大不代表代码 bug | 对比质量用单次结果，不追求段数一致 |
-| Groq 音频压缩质量损失（96-112kbps MP3 丢失高频细节） | 优先用 16kHz mono WAV（≤25MB 时），仍超限再压缩；文档推荐 16kHz mono FLAC 无损压缩优于 MP3 | 接受 MP3 压缩或切换本地模型 |
+| Groq 音频压缩质量损失（96-112kbps MP3 丢失高频细节） | 直接把原始输入（mp3/m4a/flac/wav）喂给 transcribe.py --engine groq，`groq_transcribe._compress_audio` 一步转 **16kHz mono Opus/OGG**（仅对已是 16kHz mono OGG 的输入零转换直传，避免 MP3→16k WAV→OGG 二次转换；用户偏好只用 OGG，勿手动转 FLAC/MP3/wav） | 接受 OGG 压缩或切换本地模型 |
 
 ---
 

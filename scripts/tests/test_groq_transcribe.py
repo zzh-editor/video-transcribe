@@ -12,18 +12,48 @@ import groq_transcribe
 
 
 class TestCompressAudioSmallFile(unittest.TestCase):
-    def test_under_limit_returns_original(self):
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+    def test_16k_mono_ogg_under_limit_returns_original(self):
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tf:
             tf.write(b"\x00" * 1024)
             path = tf.name
         try:
-            # file is 1KB < 25MB → no conversion
-            with patch("groq_transcribe._get_duration") as mock_dur:
-                result = groq_transcribe._compress_audio(path, max_size_mb=25)
+            # already a 16kHz mono Opus/OGG and 1KB < 25MB → zero conversion
+            with patch("groq_transcribe._get_audio_info", return_value={
+                    "codec": "opus", "rate": "16000", "channels": 1}):
+                with patch("groq_transcribe._get_duration") as mock_dur:
+                    result = groq_transcribe._compress_audio(path, max_size_mb=25)
             self.assertEqual(result, path)
             mock_dur.assert_not_called()
         finally:
             os.unlink(path)
+
+    def test_mp3_under_limit_still_converts(self):
+        # MP3 fits the cap but is NOT 16kHz mono Opus/OGG → must still be
+        # normalised once (direct MP3 → OGG), so duration IS probed.
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+            tf.write(b"\x00" * 1024)
+            path = tf.name
+        try:
+            with patch("groq_transcribe._get_audio_info", return_value={
+                    "codec": "mp3", "rate": "44100", "channels": 2}):
+                with patch("subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock()
+                    with patch("groq_transcribe._get_duration", return_value=300.0):
+                        with patch("groq_transcribe.os.path.getsize",
+                                   side_effect=lambda p: 5 * 1024 * 1024 if p == path
+                                   else 2 * 1024 * 1024):
+                            with patch("tempfile.mktemp", return_value=path + ".tmp.ogg"):
+                                result = groq_transcribe._compress_audio(path, max_size_mb=25)
+            self.assertTrue(result.endswith(".ogg"))
+            args = mock_run.call_args[0][0]
+            self.assertIn("libopus", args)
+            self.assertIn("-ar", args)
+            self.assertIn("16000", args)
+        finally:
+            os.unlink(path)
+            tmp = path + ".tmp.ogg"
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
 
 class TestCompressAudioLargeFile(unittest.TestCase):

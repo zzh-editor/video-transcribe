@@ -2,7 +2,7 @@
 
 视频/音频转录为 SRT 字幕的工具。提取音频 → Whisper 转写（本地模型或 Groq API）→ 断句/合并 → 可选润色 → 可选翻译（关键词触发），输出高精度字幕。
 
-引擎自适应：macOS arm64 默认 mlx-whisper（Apple GPU 加速），其他平台用 faster-whisper；可选 Groq API（远端 whisper-large-v3，首次运行选引擎并保存配置）。长音频自动 VAD 分片，Groq 超 25MB 自动压缩。
+引擎自适应：macOS arm64 默认 mlx-whisper（Apple GPU 加速），其他平台用 faster-whisper；可选 Groq API（远端 whisper-large-v3，首次运行选引擎并保存配置）。长音频自动 VAD 分片，Groq 引擎一步转 16kHz mono OGG（无论原始格式与大小，已是 OGG 则零转换直传）。
 
 在支持 Agent Skills 的 CLI 中，说「转录」+ 文件路径即可自动调用。
 
@@ -35,11 +35,11 @@ generate subtitles / generate srt / convert to srt
 输入视频/音频
      │
      ▼
-① 提取音频 (ffmpeg → 16kHz WAV)
+① 提取音频 (本地模型 → 16kHz WAV; Groq → 原样传入，自动转 16kHz mono OGG)
      │
      ├── 本地模型 ──────────  Groq API ──────────
-     │  macOS → mlx-whisper               API 服务端转录
-     │  其他 → faster-whisper             超 25MB 自动压缩
+     │  macOS → mlx-whisper               统一转 16kHz mono OGG（libopus）
+     │  其他 → faster-whisper             已是 16kHz mono OGG 且 ≤25MB 时零转换
      │  可选 VAD 分片 (长音频)             返回顶层 segments + words
      ▼
 ② refine_segments.py / groq_word_adapter.py
