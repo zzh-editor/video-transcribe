@@ -474,6 +474,22 @@ AI（当前会话的 LLM）直接逐段翻译，不调用外部翻译 API。
 2. 英上中下（英文在上，中文在下）
 3. 中上英下（中文在上，英文在下）
 
+### 术语验证（仅中译英，翻译完成后、进入 Step 7 前必做）
+
+执行 `docs/游戏留学SRT翻译规则_中译英.md` §六「领域挂钩的术语验证」，结合管线已检测到的领域：
+
+1. **领域来源**：优先复用 srt-enhancer（Step 4）domain_scanner 已报告并确认的领域（如 `gaming`/`maya`/`python`/`ai-3d`）。领域缺位（未走润色或未跑 domain_scanner）→ 对 `tmp/final.srt` 补跑一次：
+
+   ```bash
+   cat "tmp/final.srt" | grep -v '^[0-9]*$' | grep -v '\-\->' | \
+       python3 ~/.config/opencode/skills/srt-enhancer/scripts/domain_scanner.py
+   # 输出 domain=xxx（gaming/maya/python/ai-3d/…）
+   ```
+
+2. **按领域定禁用词表**：从 `游戏留学SRT翻译规则_中译英.md` §二 行业术语表选取本领域适用的「机翻误区」条目（gaming 至少含 `big studio`/`HR department`/`job-hunting portfolio`/`school recruitment offer`/`autumn recruiting` 等）。
+3. **扫描译文并替换**：逐条检查译文是否出现禁用词，命中即替换为行业词（`major studio`/`recruiters`/`return offer`/`new-grad offer`/`fall recruiting`/`portfolio`/`role` 等）。
+4. **汇报**：在对话中列出「领域：xxx」，报告扫描结果（替换了哪些条、原文→译文），提交用户确认后再进入 Step 7。领域检测、术语替换决策均不做静默操作。
+
 ## Step 7: 输出
 
 复制到输入文件同目录：
@@ -532,6 +548,7 @@ fi
 | 9 | Step 4 完成后不验证 srt-enhancer 输出 | 润色结果可能不完整 | 低质量字幕被当作最终结果，用户无法察觉缺失的修正 |
 | 10 | 在对话中打印 Groq API Key | API Key 可能被日志记录或泄露 | 只在需要时从 config.json 读取，不在命令或对话中明文显示 |
 | 11 | 下载 Whisper 模型前不检查磁盘空间 | 1.6GB 模型可能因空间不足下载失败 | 检查可用空间 ≥3GB 后再下载 |
+| 12 | 中译英完成后跳过术语验证或静默替换 | 术语验证是领域术语准确性的最后栅栏 | 原始术语挪用（big studio/HR department）进入输出，行业观众读着出戏 |
 
 ## 依赖
 
