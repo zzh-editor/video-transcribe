@@ -1,6 +1,6 @@
 ---
 name: video-transcribe
-description: "视频音频转录为字幕。输入视频/音频本地文件，提取音频 → Whisper 转写（macOS 用 MLX 加速，其他用 faster-whisper） → 可选调用 srt-enhancer 润色 → 可选翻译（默认不触发，仅当请求含关键词翻译/重写时进入翻译；输出纯中文或纯英文，双语仅按明确要求）→ 输出高精度 SRT 字幕文件。触发词：转录、转录音频、转录视频、转录字幕、把文件转成字幕、把音频转录成字幕、把视频转录成字幕、transcribe、transcribe audio、transcribe video、generate subtitles、generate srt、convert to srt"
+description: "视频音频转录为字幕。输入视频/音频本地文件，提取音频 → Whisper 转写（macOS 用 MLX 加速，其他用 faster-whisper） → 可选调用 srt-enhancer 润色 → 可选翻译（默认不触发，仅当请求含关键词翻译/重写时进入翻译；输出纯中文或纯英文，双语仅按明确要求）→ 输出高精度 SRT 字幕文件。也接受已有 .srt 文件作为翻译入口（跳过转录，直接进翻译管线）。触发词：转录、转录音频、转录视频、转录字幕、把文件转成字幕、把音频转录成字幕、把视频转录成字幕、翻译、翻译字幕、翻译这个字幕、srt 翻译、把字幕翻译成英文、把字幕翻译成中文、transcribe、transcribe audio、transcribe video、generate subtitles、generate srt、convert to srt、translate subtitles、translate srt"
 allowed-tools: [Read, Write, Edit, Bash, Glob, Grep, Question, Task, Skill, WebSearch]
 version: 3.0.1
 ---
@@ -53,6 +53,14 @@ version: 3.0.1
 用户提供一个本地视频或音频文件路径。此技能不处理 URL 下载，只处理本地文件。
 
 输出 SRT 文件保存在**输入文件所在目录**，命名为 `<输入文件名>_<语言>.srt`。
+
+### 翻译入口（输入为已有 .srt）
+
+输入是 `.srt` 文件（而非视频/音频）且请求含「翻译/重写」关键词时，**跳过 Step 0-5（环境初始化、引擎选择、转录、润色），直接进入「CHECKPOINT: 翻译触发判定」**：
+
+- 源文件拷贝为 `tmp/final.srt`（`mkdir -p <output_dir>/tmp && cp <输入.srt> tmp/final.srt`），后续走 Step 6 翻译 + Step 7 输出。
+- 不弹引擎选择、不弹润色确认、不弹清理询问改为默认不清理（除非用户要求）。
+- 输入为 `.srt` 但请求不含「翻译/重写」→ 告知本技能仅支持对 SRT 做翻译，不处理其他变换。
 
 ## 环境与模型
 
