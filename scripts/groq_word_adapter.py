@@ -8,6 +8,7 @@ existing scoring engine only to abnormal (overlong/overduration) segments.
 """
 
 import math
+import os
 import struct
 import sys
 import unicodedata
@@ -391,12 +392,33 @@ def _median_smooth(points: list[tuple[float, float]], k: int = _SMOOTH_K) -> lis
     return out
 
 
+def _decode_to_wav(audio_path: str) -> Path:
+    """ffmpeg → 16kHz mono s16 WAV。_AudioEnergy 的 RMS 读数只依赖 PCM，
+    采样率不必与原音频一致。"""
+    import subprocess
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="energy_")
+    os.close(fd)
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", audio_path,
+         "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-f", "wav", tmp],
+        check=True,
+    )
+    return Path(tmp)
+
+
 class _AudioEnergy:
     """Lazy per-window RMS reader over a WAV file, used to recover speech
     boundaries for segments that have no word timestamps."""
-
     def __init__(self, audio_path: str):
-        self._wf = wave.open(audio_path, "rb")
+        self._tmp_wav: Path | None = None
+        try:
+            self._wf = wave.open(audio_path, "rb")
+        except (wave.Error, EOFError):
+            # 非 WAV 输入（mp3/ogg/m4a…）先转成 16kHz 单声道 s16 WAV 再读
+            self._tmp_wav = _decode_to_wav(audio_path)
+            self._wf = wave.open(str(self._tmp_wav), "rb")
         self._rate = self._wf.getframerate()
         self._width = self._wf.getsampwidth()
         self._channels = self._wf.getnchannels()
@@ -511,6 +533,12 @@ class _AudioEnergy:
             self._wf.close()
         except Exception:
             pass
+        if self._tmp_wav is not None:
+            try:
+                self._tmp_wav.unlink()
+            except OSError:
+                pass
+            self._tmp_wav = None
 
 
 def _main_speech_cluster(clusters: list[tuple[float, float]], seg_start: float) -> tuple[float, float] | None:
@@ -823,6 +851,20 @@ def _leading_ascii(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _join_boundary(prev_text: str, nxt_text: str, trailing: str, leading: str) -> str:
+    """Join two segments split inside/around an English phrase.
+
+    Insert a space only when the boundary tokens look like two complete words
+    (Rookie + Awards) or a capitalised new word follows lowercase; short
+    fragments (de + saturation, off + er) rejoin without a space.
+    """
+    if leading[0].isupper() and trailing[-1].islower():
+        return prev_text + " " + nxt_text
+    if len(trailing) > 3 and len(leading) > 3:
+        return prev_text + " " + nxt_text
+    return prev_text + nxt_text
+
+
 def _merge_english_phrase_segments(segments: list[dict]) -> list[dict]:
     """Merge adjacent English phrase segments split across Groq windows (e.g. Rookie / Awards).
 
@@ -852,7 +894,7 @@ def _merge_english_phrase_segments(segments: list[dict]) -> list[dict]:
                     pass  # fall through to out.append(seg) below
                 # Check if merging keeps reasonable length and phrase is continuous speech
                 elif len((prev_text + " " + nxt_text).replace(" ", "")) <= 60:
-                    merged_text = prev_text + " " + nxt_text
+                    merged_text = _join_boundary(prev_text, nxt_text, trailing, leading)
                     merged = {
                         "start": seg["start"],
                         "end": nxt["end"],

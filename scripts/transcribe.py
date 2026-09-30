@@ -493,6 +493,14 @@ def main():
             pass
         except Exception:
             print("groq_word_adapter error, skipping", file=sys.stderr)
+
+        # Scoring splits inside refine can break English words across segments
+        # (e.g. "de|saturation"); fragments are contiguous (gap~0) so re-run merge.
+        if len(segments) > 1:
+            try:
+                segments = _merge_fragments(segments, args.max_line_length * 2)
+            except Exception:
+                print("post-refine _merge_fragments error, skipping", file=sys.stderr)
         try:
             from cleanup_segments import cleanup as cleanup_segs
             before_c = len(segments)

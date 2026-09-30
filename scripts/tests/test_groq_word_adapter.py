@@ -23,6 +23,8 @@ from groq_word_adapter import (
     _speech_span,
     _shrink_silent_tail,
     _merge_fragments_groq,
+    _merge_english_phrase_segments,
+    _join_boundary,
     refine_groq_segments,
 )
 
@@ -622,6 +624,43 @@ class TestAudioEnergy(unittest.TestCase):
         points = [(i * 0.04, v) for i, v in enumerate([100, 100, 4000, 100, 100])]
         out = _median_smooth(points, 3)
         self.assertLess(out[2][1], 200)
+
+
+class TestMergeEnglishPhraseBoundary(unittest.TestCase):
+
+    def test_de_saturation_joins_without_space(self):
+        segs = [
+            {"start": 0.0, "end": 2.0, "text": "就比方说你加个de"},
+            {"start": 2.0, "end": 2.8, "text": "saturation拉太高"},
+        ]
+        out = _merge_english_phrase_segments(segs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "就比方说你加个desaturation拉太高")
+
+    def test_rookie_awards_keeps_space(self):
+        segs = [
+            {"start": 0.0, "end": 2.0, "text": "国际性的Rookie"},
+            {"start": 2.0, "end": 3.0, "text": "Awards这个比赛"},
+        ]
+        out = _merge_english_phrase_segments(segs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "国际性的Rookie Awards这个比赛")
+
+    def test_large_gap_not_merged(self):
+        segs = [
+            {"start": 0.0, "end": 2.0, "text": "就比方说你加个de"},
+            {"start": 4.0, "end": 4.8, "text": "saturation"},
+        ]
+        out = _merge_english_phrase_segments(segs)
+        self.assertEqual(len(out), 2)
+
+    def test_join_boundary_token_lengths(self):
+        self.assertEqual(_join_boundary("加个de", "saturation", "de", "saturation"),
+                         "加个desaturation")
+        self.assertEqual(_join_boundary("Rookie", "Awards", "Rookie", "Awards"),
+                         "Rookie Awards")
+        self.assertEqual(_join_boundary("工作的off", "er", "off", "er"),
+                         "工作的offer")
 
 
 if __name__ == "__main__":
