@@ -477,6 +477,13 @@ _MERGE_GAP_S = 0.3       # near-continuous speech: gap below this = same word
 # real cases like "比较艰难" + "的" → "比较艰难的".
 _CN_FUNCTION_WORDS = frozenset("的得地了着过吧吗呢啊呀哦")
 
+# Clitic phrases that may attach after an English tail
+# ("node 的话" / "muscle 的一个") — from 人工精校 comparison.
+_CN_CLITIC_PHRASES = frozenset({"的话", "对吧", "好吧", "是吧", "的一个", "的"})
+
+# Cap for the Chinese→English back-merge (Pattern 5).
+_TIGHT_MERGE_MAX_CHARS = 30
+
 
 def _is_eng_fragment(seg: dict) -> bool:
     """True if the segment is a short pure-ASCII English remnant
@@ -511,7 +518,9 @@ def _cn_fragment_fits(prev_text: str, frag_text: str) -> bool:
     if not prev_text:
         return False
     if not _is_cn_char(prev_text[-1]):
-        return False
+        # English tail + Chinese clitic ("create node" + "的话",
+        # "trapezius muscle" + "的一个") — 人工精校 keeps these merged.
+        return frag_text in _CN_CLITIC_PHRASES
     # Function-word remnant (的/了/吧…) — attaches to a verb/noun ending.
     # Reject stacking on an existing 的 to avoid "的的".
     if len(frag_text) == 1 and frag_text in _CN_FUNCTION_WORDS:
@@ -569,12 +578,17 @@ def _merge_fragments(segments: list[dict], max_chars: int) -> list[dict]:
                 and _is_eng(prev_text[-1]) and _is_eng(curr_text[0])
                 and _gap_s(prev, seg) < _MERGE_GAP_S):
             # Two separate English words (e.g. Rookie / Awards) vs a single
-            # broken word (e.g. posit / ion). Use a space when both sides look
-            # like complete words (>3 chars or capitalised new word).
+            # broken word (e.g. posit / ion, de / saturation). Space only when
+            # BOTH boundary ascii tokens look like complete words (>3 chars),
+            # so short fragments (de, off, er) rejoin without a space.
+            tok_prev = re.search(r"[A-Za-z0-9._+\-#&/]+$", prev_text)
+            tok_next = re.search(r"^[A-Za-z0-9._+\-#&/]+", curr_text)
+            len_prev_tok = len(tok_prev.group(0)) if tok_prev else 0
+            len_next_tok = len(tok_next.group(0)) if tok_next else 0
             need_space = False
-            if curr_text and curr_text[0].isupper() and prev_text[-1].islower():
+            if curr_text[0].isupper() and prev_text[-1].islower():
                 need_space = True
-            elif len(prev_text) > 3 and len(curr_text) > 3:
+            elif len_prev_tok > 3 and len_next_tok > 3:
                 # both substantial -> likely two words (Rookie Awards)
                 need_space = True
             combined = (prev_text + " " + curr_text) if need_space else (prev_text + curr_text)
@@ -586,6 +600,27 @@ def _merge_fragments(segments: list[dict], max_chars: int) -> list[dict]:
                 }
                 i += 1
                 continue
+
+        # Pattern 5: a SHORT pure-English segment split off from a Chinese
+        # tail mid-utterance ("可能比较" + "repetitive", "一个" + "dictionary").
+        # Parenthetical notes are stripped before the English check so
+        # "pickle(序列化)" still counts as English.
+        curr_bare = re.sub(r"\([^)]*\)|（[^）]*）", "", curr_text)
+        if (prev_text and curr_bare
+                and _is_cn_char(prev_text[-1])
+                and not _is_eng_fragment(seg)
+                and all(_is_eng(c) for c in curr_bare if not c.isspace())
+                and len(curr_bare) <= 16
+                and _gap_s(prev, seg) < _MERGE_GAP_S
+                and len((prev_text + curr_bare).replace(" ", ""))
+                <= min(max_chars, _TIGHT_MERGE_MAX_CHARS)):
+            out[-1] = {
+                "start": prev["start"],
+                "end": seg["end"],
+                "text": prev_text + " " + curr_text,
+            }
+            i += 1
+            continue
 
         # Pattern 2: English remnant attaches forward to the next segment
         if (_is_eng_fragment(seg) and i + 1 < n
@@ -608,7 +643,9 @@ def _merge_fragments(segments: list[dict], max_chars: int) -> list[dict]:
         if (_is_cn_fragment(seg)
                 and _gap_s(prev, seg) < _MERGE_GAP_S
                 and _cn_fragment_fits(prev_text, curr_text)):
-            combined = prev_text + curr_text
+            sep = "" if (not prev_text or _is_cn_char(prev_text[-1])
+                         or prev_text[-1].isspace()) else " "
+            combined = prev_text + sep + curr_text
             if len(combined.replace(" ", "")) <= _MERGE_HARD_LIMIT:
                 out[-1] = {
                     "start": prev["start"],

@@ -205,14 +205,35 @@ class TestRefineSegments(unittest.TestCase):
         self.assertEqual(out[0]["text"], "A")
         self.assertEqual(out[1]["text"], "B")
 
-    def test_merge_fragments_chinese_boundary_no_merge(self):
-        # Chinese chars at boundary → no merge
+    def test_merge_fragments_chinese_tail_short_english_merge(self):
+        # 人工精校 merges a short English tail split from a Chinese segment
+        # ("比较" + "repetitive" → one row) when the gap is tiny.
         segs = [
             {"start": 0.0, "end": 1.0, "text": "工作的"},
             {"start": 1.0, "end": 2.0, "text": "offer"},
         ]
         out = _merge_fragments(segs, 25)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "工作的 offer")
+
+    def test_merge_fragments_chinese_english_gap_no_merge(self):
+        # true sentence boundary (gap >= 0.3s) stays split
+        segs = [
+            {"start": 0.0, "end": 1.0, "text": "今天就到这里"},
+            {"start": 1.4, "end": 2.4, "text": "Next topic"},
+        ]
+        out = _merge_fragments(segs, 25)
         self.assertEqual(len(out), 2)
+
+    def test_merge_fragments_english_tail_clitic(self):
+        # English tail + Chinese clitic phrase merges back ("node 的话")
+        segs = [
+            {"start": 0.0, "end": 1.0, "text": "就叫 network node"},
+            {"start": 1.0, "end": 1.3, "text": "的话"},
+        ]
+        out = _merge_fragments(segs, 25)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "就叫 network node 的话")
 
     def test_merge_fragments_too_long_no_merge(self):
         # combined beyond hard limit → keep separate
@@ -224,6 +245,26 @@ class TestRefineSegments(unittest.TestCase):
         ]
         out = _merge_fragments(segs, 25)
         self.assertEqual(len(out), 2)
+
+    def test_merge_fragments_de_saturation_no_space(self):
+        # "de" + "saturation" rejoin WITHOUT space (real case: 0923.mp3 seg33/34)
+        segs = [
+            {"start": 0.0, "end": 2.0, "text": "就比方说你加个de"},
+            {"start": 2.0, "end": 2.8, "text": "saturation"},
+        ]
+        out = _merge_fragments(segs, 25)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "就比方说你加个desaturation")
+
+    def test_merge_fragments_two_full_words_keep_space(self):
+        # both boundary ascii tokens >3 chars -> two words, keep the space
+        segs = [
+            {"start": 0.0, "end": 2.0, "text": "国际性的Rookie"},
+            {"start": 2.0, "end": 3.0, "text": "Awards这个比赛"},
+        ]
+        out = _merge_fragments(segs, 25)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["text"], "国际性的Rookie Awards这个比赛")
 
     # ── L1: Chinese remnant merge ─────────────────────────────────────
 
