@@ -29,10 +29,10 @@ INITIAL_PROMPT_ZH = "以下是普通话的句子，使用简体中文书写。"
 # ── Helpers ────────────────────────────────────────────────────────
 
 def format_timestamp(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds - int(seconds)) * 1000)
+    total_ms = max(0, int(round(seconds * 1000)))
+    h, remainder = divmod(total_ms, 3_600_000)
+    m, remainder = divmod(remainder, 60_000)
+    s, ms = divmod(remainder, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
@@ -70,23 +70,32 @@ def get_audio_duration(path: str) -> float:
 # ── Raw segment processing ─────────────────────────────────────────
 
 def _normalize_segments(segments: list) -> list[dict]:
+    quality_keys = ("no_speech_prob", "avg_logprob", "compression_ratio",
+                    "temperature", "tokens")
     out = []
     for seg in segments:
         if isinstance(seg, dict):
-            out.append({
+            normalized = {
                 "start": seg.get("start", 0.0),
                 "end": seg.get("end", 0.0),
                 "text": seg.get("text", "").strip(),
                 "words": list(seg.get("words", [])),
-            })
+            }
+            normalized.update({k: seg[k] for k in quality_keys if k in seg})
+            out.append(normalized)
         else:
             words = getattr(seg, "words", None) or []
-            out.append({
+            normalized = {
                 "start": getattr(seg, "start", 0.0),
                 "end": getattr(seg, "end", 0.0),
                 "text": getattr(seg, "text", "").strip(),
                 "words": list(words),
-            })
+            }
+            for key in quality_keys:
+                value = getattr(seg, key, None)
+                if isinstance(value, (int, float, list, tuple)):
+                    normalized[key] = value
+            out.append(normalized)
     return out
 
 
@@ -207,11 +216,13 @@ def _transcribe_vad_chunks(audio_path: str, model_name: str, language: str | Non
 
 # ── Shared post-processing ─────────────────────────────────────────
 
-def _postprocess(segments: list[dict], max_line_length: int, max_line_ms: int) -> list[dict]:
+def _postprocess(segments: list[dict], max_line_length: int, max_line_ms: int,
+                 cleanup_audit: list[dict] | None = None) -> list[dict]:
     """Shared refine + cleanup pipeline for both mlx and faster-whisper."""
     if not segments:
         return segments
     raw_count = len(segments)
+    source_segments = segments
     out = segments
     try:
         from refine_segments import refine as refine_segs
@@ -225,10 +236,24 @@ def _postprocess(segments: list[dict], max_line_length: int, max_line_ms: int) -
     except Exception as e:
         print(f"refine_segments error ({e}), skipping", file=sys.stderr)
 
+    quality_keys = ("no_speech_prob", "avg_logprob", "compression_ratio",
+                    "temperature", "tokens")
+    for refined in out:
+        sources = [
+            {"start": source.get("start"), "end": source.get("end"),
+             **{k: source[k] for k in quality_keys if k in source}}
+            for source in source_segments
+            if source.get("start", 0) < refined.get("end", 0)
+            and source.get("end", 0) > refined.get("start", 0)
+            and any(k in source for k in quality_keys)
+        ]
+        if sources:
+            refined["source_quality"] = sources[0] if len(sources) == 1 else sources
+
     try:
         from cleanup_segments import cleanup as cleanup_segs
         before_c = len(out)
-        out = cleanup_segs(out)
+        out = cleanup_segs(out, audit=cleanup_audit)
         if len(out) != before_c:
             print(f"cleanup_segments: {before_c} → {len(out)} segments (removed empty/duplicate)",
                   file=sys.stderr)
@@ -245,7 +270,8 @@ def _postprocess(segments: list[dict], max_line_length: int, max_line_ms: int) -
 
 def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
                    max_line_length: int, pause_threshold: float,
-                   max_line_ms: int, vad: bool = False) -> list[dict]:
+                   max_line_ms: int, vad: bool = False,
+                   cleanup_audit: list[dict] | None = None) -> list[dict]:
     models_dir = get_model_path()
     _migrate_model_cache(models_dir)
     os.environ["HF_HOME"] = models_dir
@@ -281,12 +307,13 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
         print("error: no segments in mlx-whisper output", file=sys.stderr)
         sys.exit(1)
 
-    return _postprocess(raw_segments, max_line_length, max_line_ms)
+    return _postprocess(raw_segments, max_line_length, max_line_ms, cleanup_audit)
 
 
 def transcribe_faster(audio_path: str, model_name: str, language: str | None,
                       max_line_length: int, pause_threshold: float,
-                      max_line_ms: int, vad: bool = False) -> list[dict]:
+                      max_line_ms: int, vad: bool = False,
+                      cleanup_audit: list[dict] | None = None) -> list[dict]:
     """Transcribe via faster-whisper (CTranslate2). Mirrors transcribe_mlx interface."""
     models_dir = get_model_path()
     os.environ["HF_HOME"] = models_dir
@@ -332,7 +359,7 @@ def transcribe_faster(audio_path: str, model_name: str, language: str | None,
         print("error: no segments in faster-whisper output", file=sys.stderr)
         sys.exit(1)
 
-    return _postprocess(raw_segments, max_line_length, max_line_ms)
+    return _postprocess(raw_segments, max_line_length, max_line_ms, cleanup_audit)
 
 
 # ── SRT writer ─────────────────────────────────────────────────────
@@ -365,7 +392,8 @@ def export_refined_json(segments: list[dict], output_path: str):
                 and w.get("end") is not None
             ],
             **{k: seg[k] for k in ("no_speech_prob", "avg_logprob",
-                                   "compression_ratio") if k in seg},
+                                   "compression_ratio", "temperature", "tokens",
+                                   "source_quality", "cleanup_flags") if k in seg},
         }
         for seg in segments
     ]
@@ -373,6 +401,14 @@ def export_refined_json(segments: list[dict], output_path: str):
         json.dump(payload, f, ensure_ascii=False, indent=1)
     print(f"exported refined segments (with words) -> {output_path}",
           file=sys.stderr)
+
+
+def export_cleanup_audit(audit: list[dict], output_path: str) -> None:
+    import json
+    audit_path = output_path + ".cleanup.json"
+    with open(audit_path, "w", encoding="utf-8") as f:
+        json.dump(audit, f, ensure_ascii=False, indent=1)
+    print(f"cleanup audit -> {audit_path}", file=sys.stderr)
 
 
 # ── Platform detection ─────────────────────────────────────────────
@@ -442,6 +478,7 @@ def main():
     )
 
     output_path = args.output or str(audio_path.with_suffix(".srt"))
+    cleanup_audit: list[dict] = []
 
     lang = args.language
     pause_threshold = (args.pause_ms / 1000.0) if args.pause_ms is not None else get_pause_threshold(lang)
@@ -489,8 +526,9 @@ def main():
                 print(f"groq_word_adapter: {before} → {len(segments)} segments "
                       f"(jieba+scoring split for abnormal segments)",
                       file=sys.stderr)
-        except ImportError:
-            pass
+        except ImportError as e:
+            print(f"warning: groq_word_adapter unavailable ({e}); "
+                  "retaining Groq segment boundaries", file=sys.stderr)
         except Exception:
             print("groq_word_adapter error, skipping", file=sys.stderr)
 
@@ -504,7 +542,7 @@ def main():
         try:
             from cleanup_segments import cleanup as cleanup_segs
             before_c = len(segments)
-            segments = cleanup_segs(segments)
+            segments = cleanup_segs(segments, audit=cleanup_audit)
             if len(segments) != before_c:
                 print(f"cleanup_segments: {before_c} → {len(segments)} segments (removed empty/duplicate)",
                       file=sys.stderr)
@@ -518,6 +556,7 @@ def main():
             segments,
             args.export_refined or (str(output_path) + ".words.json"),
         )
+        export_cleanup_audit(cleanup_audit, output_path)
         write_srt(segments, output_path)
         print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
         return output_path
@@ -546,7 +585,7 @@ def main():
     segments = seg_func(
         str(audio_path), model_name, lang,
         args.max_line_length, pause_threshold, args.max_line_ms,
-        vad=vad_enabled,
+        vad=vad_enabled, cleanup_audit=cleanup_audit,
     )
 
     # Always export word-timestamps JSON so L3 re-segmentation needs no
@@ -555,6 +594,7 @@ def main():
         segments,
         args.export_refined or (str(output_path) + ".words.json"),
     )
+    export_cleanup_audit(cleanup_audit, output_path)
     write_srt(segments, output_path)
     print(f"done! {len(segments)} segments -> {output_path}", file=sys.stderr)
     return output_path

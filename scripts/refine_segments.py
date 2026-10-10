@@ -763,16 +763,14 @@ def parse_srt(path: str) -> list[dict]:
 def write_srt(segments: list[dict], path: str):
     with open(path, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, 1):
-            start = seg["start"]
-            end = seg["end"]
-            sh = int(start // 3600)
-            sm = int((start % 3600) // 60)
-            ss = int(start % 60)
-            sms = int((start - int(start)) * 1000)
-            eh = int(end // 3600)
-            em = int((end % 3600) // 60)
-            es = int(end % 60)
-            ems = int((end - int(end)) * 1000)
+            start_ms = max(0, round(seg["start"] * 1000))
+            end_ms = max(0, round(seg["end"] * 1000))
+            sh, start_ms = divmod(start_ms, 3_600_000)
+            sm, start_ms = divmod(start_ms, 60_000)
+            ss, sms = divmod(start_ms, 1000)
+            eh, end_ms = divmod(end_ms, 3_600_000)
+            em, end_ms = divmod(end_ms, 60_000)
+            es, ems = divmod(end_ms, 1000)
             f.write(f"{i}\n")
             f.write(f"{sh:02d}:{sm:02d}:{ss:02d},{sms:03d} --> "
                     f"{eh:02d}:{em:02d}:{es:02d},{ems:03d}\n")

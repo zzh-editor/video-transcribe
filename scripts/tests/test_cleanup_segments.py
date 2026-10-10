@@ -129,6 +129,14 @@ class TestCleanupIntegration(unittest.TestCase):
         seg = {"start": 0, "end": 1, "text": "请不吝点赞订阅转发打赏支持明镜与点点栏目"}
         self.assertEqual(len(cleanup([seg])), 0)
 
+    def test_removed_segments_are_audited(self):
+        audit = []
+        seg = {"start": 0, "end": 1,
+               "text": "请不吝点赞订阅转发打赏支持明镜与点点栏目"}
+        self.assertEqual(cleanup([seg], audit=audit), [])
+        self.assertEqual(audit[0]["action"], "removed")
+        self.assertIn("known_hallucination", audit[0]["reasons"])
+
     def test_dense_hallucination_removed_via_cleanup(self):
         seg = {"start": 0.0, "end": 0.5, "text": "请不吝点赞订阅转发打赏支持明镜与点点栏目"}
         self.assertEqual(len(cleanup([seg])), 0)

@@ -167,22 +167,52 @@ def _is_no_speech_hallucination(seg: dict) -> bool:
     return True
 
 
-def cleanup(segments: list[dict]) -> list[dict]:
+def _record_audit(audit: list[dict] | None, seg: dict,
+                  reasons: list[str], action: str) -> None:
+    if audit is not None:
+        audit.append({
+            "start": seg.get("start"),
+            "end": seg.get("end"),
+            "text": seg.get("text", ""),
+            "reasons": reasons,
+            "action": action,
+        })
+
+
+def cleanup(segments: list[dict], audit: list[dict] | None = None) -> list[dict]:
     if not segments:
         return []
 
-    # Step 1: remove empty-text segments
-    non_empty = [s for s in segments if s.get("text", "").strip()]
+    # Step 1: remove empty text and record each cleanup decision when requested.
+    non_empty = []
+    for seg in segments:
+        if seg.get("text", "").strip():
+            non_empty.append(seg)
+        else:
+            _record_audit(audit, seg, ["empty_text"], "removed")
     if not non_empty:
         return []
 
-    # Step 1.5: remove hallucinated segments
-    non_empty = [s for s in non_empty
-                 if not _is_repeat_loop(s.get("text", ""))
-                 and not _is_known_hallucination(s.get("text", ""))
-                 and not _is_dense_hallucination(s)
-                 and not _is_sparse_hallucination(s)
-                 and not _is_no_speech_hallucination(s)]
+    # Step 1.5: remove hallucinated segments and retain an audit trail.
+    kept = []
+    for seg in non_empty:
+        text = seg.get("text", "")
+        reasons = []
+        if _is_repeat_loop(text):
+            reasons.append("repeat_loop")
+        if _is_known_hallucination(text):
+            reasons.append("known_hallucination")
+        if _is_dense_hallucination(seg):
+            reasons.append("dense_text")
+        if _is_sparse_hallucination(seg):
+            reasons.append("sparse_text")
+        if _is_no_speech_hallucination(seg):
+            reasons.append("no_speech_metrics")
+        if reasons:
+            _record_audit(audit, seg, reasons, "removed")
+        else:
+            kept.append(seg)
+    non_empty = kept
     if not non_empty:
         return []
 
@@ -197,6 +227,7 @@ def cleanup(segments: list[dict]) -> list[dict]:
             gap = s.get("start", 0) - last.get("end", 0)
             if gap <= MAX_DUP_MERGE_GAP_S:
                 last["end"] = s["end"]
+                _record_audit(audit, s, ["duplicate_text"], "merged")
             else:
                 merged.append(s)
         else:
@@ -253,16 +284,14 @@ def parse_srt(path: str) -> list[dict]:
 def write_srt(segments: list[dict], path: str):
     with open(path, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, 1):
-            start = seg["start"]
-            end = seg["end"]
-            sh = int(start // 3600)
-            sm = int((start % 3600) // 60)
-            ss = int(start % 60)
-            sms = int((start - int(start)) * 1000)
-            eh = int(end // 3600)
-            em = int((end % 3600) // 60)
-            es = int(end % 60)
-            ems = int((end - int(end)) * 1000)
+            start_ms = max(0, round(seg["start"] * 1000))
+            end_ms = max(0, round(seg["end"] * 1000))
+            sh, start_ms = divmod(start_ms, 3_600_000)
+            sm, start_ms = divmod(start_ms, 60_000)
+            ss, sms = divmod(start_ms, 1000)
+            eh, end_ms = divmod(end_ms, 3_600_000)
+            em, end_ms = divmod(end_ms, 60_000)
+            es, ems = divmod(end_ms, 1000)
             f.write(f"{i}\n")
             f.write(f"{sh:02d}:{sm:02d}:{ss:02d},{sms:03d} --> "
                     f"{eh:02d}:{em:02d}:{es:02d},{ems:03d}\n")

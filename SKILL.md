@@ -145,7 +145,7 @@ mkdir -p "<output_dir>/tmp"
 ffmpeg -i "<input>" -vn -ar 16000 -ac 1 "<output_dir>/tmp/audio.wav"
 ```
 
-**Groq API (engine=groq)** — **跳过 WAV 提取，直接把原始文件传给 transcribe.py**（如 mp3/m4a/flac/wav 均可）。`groq_transcribe.py` 会一步转成 16kHz 单声道 Opus/OGG 再上传，避免「先抽 16kHz WAV → 再转 OGG」的二次转换（对输入通常是 mp3 的情况，直接 MP3 → 16kHz mono OGG 单次转码，质量损失最小、上传体也小）：
+**Groq API (engine=groq)** — **跳过 WAV 提取，直接把原始文件传给 transcribe.py**（如 mp3/m4a/flac/wav 均可）。Groq 支持且不超过 25MB 的格式会原样上传；超限或不支持的格式才转成 16kHz 单声道 Opus/OGG：
 
 ```bash
 cp "<input>" "<output_dir>/tmp/audio.src"   # 原样保留，交给脚本处理
@@ -208,6 +208,7 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 - macOS (arm64) → mlx-whisper（Apple GPU）；其他平台 → faster-whisper（CPU/CUDA）
 - 首次运行自动下载模型（约 1.6GB Whisper）至技能目录 `models/`
 - 内置 refine_segments.py（语义断句）和 cleanup_segments.py（去空+去重）流水线
+- 本地转录会保留 ASR 质量指标；每次运行都会写 `<输出srt>.cleanup.json`，记录清理动作，无动作时内容为 `[]`
 
 ### 使用 Groq API (engine=groq)
 
@@ -227,7 +228,7 @@ venv/bin/python3 scripts/transcribe.py "<输出目录>/tmp/audio.src" \
 ```
 
 注意事项：
-- 脚本会统一把输入转成 **16kHz 单声道 Opus/OGG** 再上传（`groq_transcribe._compress_audio` 内置，libopus）。输入已是 16kHz mono OGG 且 ≤25MB 时零转换直传；其余任何格式（mp3/m4a/flac/wav，无论是否超 25MB）一律一步转成 OGG。**不要手动转 FLAC/MP3/wav 再喂脚本**，避免二次转换
+- Groq 支持格式（FLAC、M4A、MP3、MP4、MPEG、MPGA、OGG、WAV、WEBM）且 ≤25MB 时原样上传，避免额外有损转码；超限或其他格式才转成 16kHz 单声道 Opus/OGG。不要为绕过大小限制手动转成有损格式
 - 音频超过 **25MB** 也没关系：`_compress_audio` 按时长推码率（16-128kbps）保证落在限内，超限时自动减半码率重编 ≤3 次
 - 无需 VAD 分片（API 服务端处理）
 - words 为字符级（中文单字），通过 `groq_word_adapter.py` 用 jieba 聚合为词组后评分
@@ -530,7 +531,7 @@ fi
 
 ### Step 7.5: [可选] 输出竖屏字幕
 
-对 `tmp/final.srt` 调用 srt-enhancer 的竖屏管线（见 srt-enhancer「输出竖屏字幕」章节），为 9:16 竖屏视频重断句。竖屏字幕每行 4-12 字、按语义边界断句、时间轴按字数比例重排。
+对 `tmp/final.srt` 调用 srt-enhancer 的竖屏管线（见 srt-enhancer「输出竖屏字幕」章节），为 9:16 竖屏视频重断句。竖屏字幕每行 4-12 字、按语义边界断句；若字幕文本与词级时间完全对齐，则按真实词边界分配内部切点，否则回退到按字数比例估时。
 
 **用 Skill 工具加载 srt-enhancer 技能**，对 `tmp/final.srt` 执行：
 
@@ -623,7 +624,7 @@ AI 处理完成后可清理 `tmp/` 目录。
 | Groq 速率限制 (429) | 提示频率超限，稍后再试 | 建议切换本地模型 |
 | Groq API 连接失败 | 检查网络连接 | 建议切换本地模型 |
 | `requests` 未安装（Groq 模式） | `venv/bin/pip install requests` | 切换本地模型 |
-| `import jieba` 失败（Groq 模式） | `venv/bin/pip install jieba==0.42.1` | Groq adapter 跳过，保留原始 segment |
+| `import jieba` 失败（Groq 模式） | `venv/bin/pip install jieba==0.42.1` | 显示 warning，Groq 保留原始 segment 边界 |
 | config.json 损坏或格式无效 | 提示检查 JSON 格式，展示预期结构 | 用 Question 询问是否重新执行引擎选择流程 |
 | Groq 中文 prompt 被复述为幻觉（实测：`请准确转写专业术．保持简体中文。` 在全片静音段出现 20+ 处，no_speech_prob/avg_logprob 均正常，无法被质量指标识别） | 默认不传 prompt（`DEFAULT_GROQ_PROMPT=None`），如需传只传英文 prompt（实测英文 prompt 无复述幻觉但也无术语改善）；黑名单锚点 `请准确转写专业`/`保持简体中文` 清除残留 | 术语错识靠润色环节 correction-table 修正，不依赖 prompt |
 | Groq 静音窗口包含短词段（≤3 字符却 4-11s，如 `OK`/`然后`/`对然后`，word 时间戳覆盖整个窗口不可靠） | `_absorb_isolated_crumbs` 将孤立短词吸收进无缝衔接的后段（gap≤0.5s） | 保持原样（文本正确，仅时间轴未精确收缩） |
@@ -631,7 +632,7 @@ AI 处理完成后可清理 `tmp/` 目录。
 | Groq 输出时间重叠（实测 4 处 279-500ms，如 `100-112.5→101.8-102.6` 前段尾部压后段） | `_deoverlap()` 按 start 排序后 `prev.end = cur.start - 0.02s` 修正，二轮执行（合并后 + 终局缩边后） | 保持重叠（播放器取后段覆盖） |
 | Groq 段首尾静默膨胀（`ratio<0.4` 且首/尾各省 ≥0.8s，如 13s 窗口实际语音仅 1.1s） | `_shrink_silent_edges()` 双向缩至 `first_word.start-0.2s`/`last_word.end+0.2s`，合并后二轮缩边 | `_shrink_silent_tail` 仅缩尾（旧逻辑） |
 | Groq 对同一输入多次调用返回非确定段数（实测 137/163/172/282/269/524 不等） | 属 API 正常行为，重跑结果不同；段数差异大不代表代码 bug | 对比质量用单次结果，不追求段数一致 |
-| Groq 音频压缩质量损失（96-112kbps MP3 丢失高频细节） | 直接把原始输入（mp3/m4a/flac/wav）喂给 transcribe.py --engine groq，`groq_transcribe._compress_audio` 一步转 **16kHz mono Opus/OGG**（仅对已是 16kHz mono OGG 的输入零转换直传，避免 MP3→16k WAV→OGG 二次转换；用户偏好只用 OGG，勿手动转 FLAC/MP3/wav） | 接受 OGG 压缩或切换本地模型 |
+| Groq 上传大小或格式限制 | 支持格式且 ≤25MB 时原样传入；超限或不支持时由 `_compress_audio` 转成 16kHz mono Opus/OGG | 超限转码仍失败时切换本地模型；不声称转码能提升识别率 |
 
 ---
 
@@ -731,14 +732,15 @@ AI 处理完成后可清理 `tmp/` 目录。
 
 cleanup_segments.py
   ├── 去空文本段（text.strip() == "" 直接删除，与 refine 的 `_clean_segments` 冗余兜底）
-  ├── 幻觉检测（四规则并联，任一命中即删）：
+  ├── 幻觉检测（五条规则并行；命中项写入审计 sidecar）：
   │     ├── `_is_repeat_loop`：极低字符复现率/超短词汇表的 loop 判定
   │     ├── `_is_known_hallucination`：黑名单（支持空格归一化匹配）
   │     ├── `_is_dense_hallucination`：密度判定（≥15 字且时长 <1.0s 时字速 ≥15 字/s → 幻觉）
+  │     ├── `_is_sparse_hallucination`：稀疏判定（时长 ≥20s 且字速 <0.5 字/s → 幻觉）
   │     └── `_is_no_speech_hallucination`：质量指标判定（Groq verbose_json 返回的 `no_speech_prob ≥0.8` 且 `avg_logprob ≤-1.0` 时判定静默段幻觉，缺指标则跳过）
   └── 合并相邻重复段（仅当文本不区分大小写相同且 `gap = cur.start - prev.end ≤ 1.0s` 时合并，跨远距重复保留）
 
-两阶段分工：预清洗处理 ASR 噪声（空/零时长），后清洗处理 VAD 边界重叠和幻觉。
+两阶段分工：预清洗处理 ASR 噪声（空/零时长），后清洗处理 VAD 边界重叠和幻觉。被删除或合并的条目会写入 `<输出srt>.cleanup.json`，包含原文本、时间、命中规则和动作，供复核与恢复；没有清理动作时 sidecar 写入空数组，避免复用输出路径时留下旧记录。
 
 ## 附录: Groq Word Adapter（顶层字符 words + jieba 聚词）
 
