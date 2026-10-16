@@ -347,6 +347,11 @@ def _find_split(text: str, char_pos: int, target_chars: int,
                  max_chars: int) -> int:
     """Find a good split position near char_pos + target_chars."""
     end = min(char_pos + target_chars, len(text))
+    # The "keep an embedded English phrase together" guards below only make
+    # sense for Chinese lines carrying an English term. On English text every
+    # word space is letter-sandwiched, so the guards skipped them all and the
+    # splitter fell through to cutting mid-word ("impor" | "tant").
+    keep_phrase = any(_is_cn_char(ch) for ch in text)
 
     # 1. Try punctuation (strong boundary)
     for c in range(end, max(char_pos, end - 6), -1):
@@ -358,14 +363,16 @@ def _find_split(text: str, char_pos: int, target_chars: int,
     for c in range(end, max(char_pos, end - 15), -1):
         if c > char_pos and text[c - 1] == " ":
             # Don't split a space that is sandwiched by English letters
-            if c - 2 >= 0 and c < len(text) and _is_eng(text[c - 2]) and _is_eng(text[c]):
+            if (keep_phrase and c - 2 >= 0 and c < len(text)
+                    and _is_eng(text[c - 2]) and _is_eng(text[c])):
                 continue
             return c
 
     # 3. Try space forward — same phrase protection
     for c in range(end, min(len(text), end + 10)):
         if text[c] == " ":
-            if c - 1 >= 0 and c + 1 < len(text) and _is_eng(text[c - 1]) and _is_eng(text[c + 1]):
+            if (keep_phrase and c - 1 >= 0 and c + 1 < len(text)
+                    and _is_eng(text[c - 1]) and _is_eng(text[c + 1])):
                 continue
             return c + 1
 
@@ -375,11 +382,14 @@ def _find_split(text: str, char_pos: int, target_chars: int,
         for c in range(end, min(len(text), end + 10)):
             if not _is_eng(text[c]):
                 # Skip a space that is sandwiched by English letters (phrase-internal)
-                if text[c] == " " and c + 1 < len(text) and _is_eng(text[c + 1]) and c - 1 >= 0 and _is_eng(text[c - 1]):
+                if (keep_phrase and text[c] == " " and c + 1 < len(text)
+                        and _is_eng(text[c + 1]) and c - 1 >= 0 and _is_eng(text[c - 1])):
                     continue
                 return c
     # Also handle case where end lands exactly on the phrase-internal space
-    if end > char_pos and end < len(text) and text[end] == " " and end - 1 >= 0 and end + 1 < len(text) and _is_eng(text[end - 1]) and _is_eng(text[end + 1]):
+    if (keep_phrase and end > char_pos and end < len(text) and text[end] == " "
+            and end - 1 >= 0 and end + 1 < len(text)
+            and _is_eng(text[end - 1]) and _is_eng(text[end + 1])):
         # end is the space between Rookie and Awards — jump over the whole phrase
         for c in range(end + 1, min(len(text), end + 16)):
             if not _is_eng(text[c]):
@@ -461,6 +471,12 @@ def _fallback_split(
 
 def _is_eng(ch: str) -> bool:
     return 'a' <= ch <= 'z' or 'A' <= ch <= 'Z'
+
+
+def _is_word_edge(ch: str) -> bool:
+    """Whitespace or ASCII punctuation — i.e. a boundary an ASCII word can
+    legitimately end/start at. CJK neighbours mean the word is glued in."""
+    return ch.isspace() or (ch.isascii() and not ch.isalnum())
 
 
 def _is_cn_char(ch: str) -> bool:
@@ -578,15 +594,23 @@ def _merge_fragments(segments: list[dict], max_chars: int) -> list[dict]:
                 and _is_eng(prev_text[-1]) and _is_eng(curr_text[0])
                 and _gap_s(prev, seg) < _MERGE_GAP_S):
             # Two separate English words (e.g. Rookie / Awards) vs a single
-            # broken word (e.g. posit / ion, de / saturation). Space only when
-            # BOTH boundary ascii tokens look like complete words (>3 chars),
-            # so short fragments (de, off, er) rejoin without a space.
+            # broken word (e.g. posit / ion, de / saturation). A boundary token
+            # is a whole word when its outer side is whitespace, ASCII
+            # punctuation or the text edge — a length test misses short words
+            # ("pattern" + "the" -> "patternthe"), while "de" inside "加个de"
+            # is glued into CJK and must rejoin without a space.
             tok_prev = re.search(r"[A-Za-z0-9._+\-#&/]+$", prev_text)
             tok_next = re.search(r"^[A-Za-z0-9._+\-#&/]+", curr_text)
             len_prev_tok = len(tok_prev.group(0)) if tok_prev else 0
             len_next_tok = len(tok_next.group(0)) if tok_next else 0
+            prev_is_word = bool(tok_prev) and (
+                tok_prev.start() == 0 or _is_word_edge(prev_text[tok_prev.start() - 1]))
+            next_is_word = bool(tok_next) and (
+                tok_next.end() == len(curr_text) or _is_word_edge(curr_text[tok_next.end()]))
             need_space = False
             if curr_text[0].isupper() and prev_text[-1].islower():
+                need_space = True
+            elif prev_is_word and next_is_word:
                 need_space = True
             elif len_prev_tok > 3 and len_next_tok > 3:
                 # both substantial -> likely two words (Rookie Awards)

@@ -500,6 +500,8 @@ def main():
         )
         segments = result.get("segments", [])
         top_words = result.get("words", [])
+        print(f"groq: {len(segments)} raw segments, {len(top_words)} word timestamps",
+              file=sys.stderr)
         if not segments:
             print("error: no segments in Groq response", file=sys.stderr)
             sys.exit(1)
@@ -550,6 +552,18 @@ def main():
             pass
         except Exception:
             print("cleanup_segments error, skipping", file=sys.stderr)
+        # Re-attach Groq word timestamps to the final segments: split pieces
+        # drop their "words" key, so the exported JSON would carry almost no
+        # timestamps and L3 semantic review could not align anything.
+        if top_words:
+            try:
+                from groq_word_adapter import _assign_words_to_segments
+                for seg, ws in zip(segments,
+                                   _assign_words_to_segments(top_words, segments)):
+                    if ws:
+                        seg["words"] = ws
+            except Exception as e:
+                print(f"warning: word re-attach failed ({e})", file=sys.stderr)
         # Always export word-timestamps JSON so L3 re-segmentation needs no
         # re-transcription. --export-refined overrides the default path.
         export_refined_json(

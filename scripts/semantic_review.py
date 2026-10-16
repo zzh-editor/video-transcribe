@@ -249,6 +249,18 @@ def _safe_boundaries(text: str) -> set[int]:
     return safe
 
 
+def _nearest_time(char_times: list, i: int, forward: bool) -> dict | None:
+    """最近的非空字符时间。英文断点落在空格上，而空格没有时间戳 ——
+    直接取 char_times[i] 会得到 None，apply 时把分段压成零时长。"""
+    step = 1 if forward else -1
+    j = i
+    while 0 <= j < len(char_times):
+        if char_times[j]:
+            return char_times[j]
+        j += step
+    return None
+
+
 def _pick_break_times(text: str, safe: set[int], char_times: list) -> list[dict]:
     """把安全断点转成带时间戳的 cuts。断点 i 切在 text[i] 起点。
 
@@ -268,8 +280,8 @@ def _pick_break_times(text: str, safe: set[int], char_times: list) -> list[dict]
             "start": None,
             "end": None,
         }
-        t = char_times[i] if i < len(char_times) else None
-        tp = char_times[i - 1] if i - 1 < len(char_times) else None
+        t = _nearest_time(char_times, i, forward=True)
+        tp = _nearest_time(char_times, i - 1, forward=False)
         if t and tp:
             entry["start"] = round(t["start"], 3)
             entry["end"] = round(tp["end"], 3)
