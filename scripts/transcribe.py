@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import platform
 import sys
@@ -393,7 +394,7 @@ def export_refined_json(segments: list[dict], output_path: str):
             ],
             **{k: seg[k] for k in ("no_speech_prob", "avg_logprob",
                                    "compression_ratio", "temperature", "tokens",
-                                   "source_quality", "cleanup_flags") if k in seg},
+                                    "source_quality", "cleanup_flags", "timing_review") if k in seg},
         }
         for seg in segments
     ]
@@ -435,10 +436,10 @@ def main():
     parser.add_argument("audio", help="audio file path (WAV 16kHz mono)")
     parser.add_argument("--output", "-o", help="output SRT path")
     parser.add_argument("--language", "-l", help="language code (e.g. zh, en)")
-    parser.add_argument("--max-line-length", type=int, default=15,
-                        help="max characters per subtitle line (default: 15)")
-    parser.add_argument("--max-line-ms", type=int, default=3000,
-                        help="max duration per subtitle block in ms (default: 3000)")
+    parser.add_argument("--max-line-length", type=int, default=None,
+                        help="characters per subtitle line (default: 60 en / 15 other)")
+    parser.add_argument("--max-line-ms", type=int, default=None,
+                        help="duration per subtitle block in ms (default: 6000 en / 3000 other)")
     parser.add_argument("--pause-ms", type=int, default=None,
                         help="pause threshold for sentence split in ms (default: 300 zh / 500 en)")
     parser.add_argument("--full-segment", action="store_true", default=False,
@@ -463,6 +464,10 @@ def main():
                              "overrides the path.")
 
     args = parser.parse_args()
+    if args.max_line_length is None:
+        args.max_line_length = 60 if args.language == "en" else 15
+    if args.max_line_ms is None:
+        args.max_line_ms = 6000 if args.language == "en" else 3000
 
     # ── Resolve boolean flags with auto-detection ──────────────
     audio_path = Path(args.audio)
@@ -505,6 +510,34 @@ def main():
         if not segments:
             print("error: no segments in Groq response", file=sys.stderr)
             sys.exit(1)
+
+        if lang and lang.startswith("en"):
+            from english_segments import merge_english_fragments, refine_english_segments
+            from cleanup_segments import cleanup as cleanup_segs
+            segments = refine_english_segments(
+                segments, top_words, args.max_line_length, args.max_line_ms,
+                pause_threshold=args.pause_ms / 1000 if args.pause_ms is not None else 0.8)
+            segments = merge_english_fragments(segments, args.max_line_length)
+            segments = cleanup_segs(segments, audit=cleanup_audit, english=True)
+            # Groq word timestamps swallow the silence around a phrase (a cue
+            # can sit on screen for 20s while nobody talks). Trim every cue
+            # back to the speech the audio actually carries.
+            try:
+                from audio_align import align_segments
+                segments, align_report = align_segments(segments, str(audio_path))
+                if align_report:
+                    print(f"audio_align: trimmed {len(align_report)} cues to speech",
+                          file=sys.stderr)
+                    with open(str(output_path) + ".align.json", "w", encoding="utf-8") as f:
+                        json.dump(align_report, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"warning: audio_align failed ({e}); keeping raw timestamps",
+                      file=sys.stderr)
+            export_refined_json(segments, args.export_refined or (str(output_path) + ".words.json"))
+            export_cleanup_audit(cleanup_audit, output_path)
+            write_srt(segments, output_path)
+            print(f"done! {len(segments)} English captions -> {output_path}", file=sys.stderr)
+            return output_path
 
         from refine_segments import _clean_segments, _merge_fragments
         segments = _clean_segments(segments)

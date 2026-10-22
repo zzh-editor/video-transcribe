@@ -179,7 +179,17 @@ def _record_audit(audit: list[dict] | None, seg: dict,
         })
 
 
-def cleanup(segments: list[dict], audit: list[dict] | None = None) -> list[dict]:
+def cleanup(segments: list[dict], audit: list[dict] | None = None,
+            english: bool = False) -> list[dict]:
+    """Drop ASR noise and merge duplicated cues.
+
+    ``english`` disables the density-based hallucination rules (dense_text,
+    sparse_text, no_speech_metrics): their thresholds are calibrated for
+    Chinese, where speech runs ~4-8 chars/s. English speech reaches 20-30
+    chars/s, so a fast but real line gets flagged, and Groq reports high
+    no_speech_prob for the long silences around a short phrase — which drops
+    genuine words. The blacklist and repeat-loop rules stay on for both.
+    """
     if not segments:
         return []
 
@@ -202,11 +212,11 @@ def cleanup(segments: list[dict], audit: list[dict] | None = None) -> list[dict]
             reasons.append("repeat_loop")
         if _is_known_hallucination(text):
             reasons.append("known_hallucination")
-        if _is_dense_hallucination(seg):
+        if _is_dense_hallucination(seg) and not english:
             reasons.append("dense_text")
-        if _is_sparse_hallucination(seg):
+        if _is_sparse_hallucination(seg) and not english:
             reasons.append("sparse_text")
-        if _is_no_speech_hallucination(seg):
+        if _is_no_speech_hallucination(seg) and not english:
             reasons.append("no_speech_metrics")
         if reasons:
             _record_audit(audit, seg, reasons, "removed")

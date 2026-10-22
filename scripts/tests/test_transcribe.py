@@ -255,6 +255,67 @@ class TestGroqPausePropagation(unittest.TestCase):
 
 
 class TestGroqWordAdapterMainIntegration(unittest.TestCase):
+    def test_english_punctuation_survives_entire_pipeline(self):
+        import tempfile
+        from transcribe import main
+        from refine_segments import parse_srt
+
+        text = "First, what do I want? This is the story."
+        words = [{"word": word, "start": i * 0.3, "end": (i + 1) * 0.3}
+                 for i, word in enumerate(text.split())]
+        result = {"segments": [{"start": 0, "end": words[-1]["end"], "text": text}],
+                  "words": words}
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "input.mp3"
+            output = Path(directory) / "output.srt"
+            audio.write_bytes(b"audio")
+            with patch("groq_transcribe.transcribe_groq", return_value=result), \
+                    patch("groq_word_adapter._AudioEnergy", return_value=None), \
+                    patch("transcribe.get_audio_duration", return_value=4), \
+                    patch.object(sys, "argv", [
+                        "transcribe.py", str(audio), "--engine", "groq",
+                        "--language", "en", "--groq-api-key", "fake-key",
+                        "--output", str(output)]):
+                main()
+            captions = parse_srt(str(output))
+            self.assertEqual([s["text"] for s in captions],
+                             ["First,", "what do I want?", "This is the story."])
+            self.assertEqual(captions[0]["end"], words[0]["end"])
+
+    def test_english_incomplete_source_cues_merge_in_entire_pipeline(self):
+        import tempfile
+        from transcribe import main
+        from refine_segments import parse_srt
+
+        words = [
+            {"word": "Please", "start": 0, "end": 0.2},
+            {"word": "send", "start": 0.2, "end": 0.5},
+            {"word": "the", "start": 0.5, "end": 0.7},
+            {"word": "file.", "start": 0.7, "end": 1.0},
+        ]
+        result = {
+            "segments": [
+                {"start": 0, "end": 0.5, "text": "Please send"},
+                {"start": 0.5, "end": 1, "text": "the file."},
+            ],
+            "words": words,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "input.mp3"
+            output = Path(directory) / "output.srt"
+            audio.write_bytes(b"audio")
+            with patch("groq_transcribe.transcribe_groq", return_value=result), \
+                    patch("audio_align.align_segments", side_effect=lambda segs, _: (segs, [])), \
+                    patch("transcribe.get_audio_duration", return_value=1), \
+                    patch.object(sys, "argv", [
+                        "transcribe.py", str(audio), "--engine", "groq",
+                        "--language", "en", "--groq-api-key", "fake-key",
+                        "--output", str(output)]):
+                main()
+            captions = parse_srt(str(output))
+            self.assertEqual([s["text"] for s in captions], ["Please send the file."])
+            self.assertEqual((captions[0]["start"], captions[0]["end"]), (0, 1))
+
     def test_missing_adapter_emits_warning(self):
         import contextlib
         import io

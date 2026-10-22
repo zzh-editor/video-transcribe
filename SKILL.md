@@ -155,9 +155,24 @@ cp "<input>" "<output_dir>/tmp/audio.src"   # 原样保留，交给脚本处理
 
 参考第 0.5 步 `config.json` 确定的引擎，执行转写（此为 LLM Agent 工作流指令，`transcribe.py` 本身通过 `--engine` CLI 参数选择引擎）。
 
+### 英文字幕断句策略
+
+英文字幕保持单行，按原文标点和意群断句。用户提供的精校字幕仅用于学习断句风格，除非确认是同一段音频，否则不能借用其文字或时间轴。
+
+- Groq `--language en` 使用 `scripts/english_segments.py`：即使原段很短，也在有可靠词时间的逗号、分号、冒号及句末标点后断开；标点留在前条。小数、缩写、缩合词中的符号不当作句界。
+- 默认 `--max-line-length 60 --max-line-ms 6000`，对齐用户给出的单行样例长度。英文词间空格计入长度。长意群才补切短语边界，不为凑长度跨标点合并，也不把中文 8–18 字规则套在英文上。明确指定的行长以用户要求为准。
+- 保留单词、缩合词和正常词间空格；英文片段合并由下方规则控制，不运行中英混排的英文短语/残片合并步骤。
+- `merge_english_fragments`：把时间相连、未以标点收尾的残句合成意群；前条以依赖词收尾、后条以小写承接或冠词开头、或后条只有一个词时，才考虑合并。独立介词短语不单独触发合并。句末/逗号等标点、完整短应答和超过 0.4s 的停顿会挡住合并；合并后仍受最大行长限制。未合并的短 cue 再补足可读时长。
+- `audio_align.py`：Groq 的 word 时间戳会把句后的静默并进词区间（一条 `so` 占 8.5s）。转录后按 0.2s RMS 包络（阈值 = 噪声底 +10dB）收缩每条的首尾静默，首尾各留 0.25s；改动的条目写入 `<输出>.align.json`。需要 numpy。
+- 英文路径的 cleanup 跳过 `dense_text` / `sparse_text` / `no_speech_metrics` 三条密度启发式（阈值是中文口径，英文快速语速与 Groq 的静默段 no_speech_prob 会误伤真实句子）；黑名单与重复环检测保留。
+- 内部切点来自原始 words，先按词序对齐，再限制到原 segment 时间范围。缺词或错序不按字符比例估时，`timing_review` 标记保留到 words sidecar；超长或明显异常段须复核或局部补转录。
+- 断句回归比较时固定同一份原始响应，避免 API 多次识别差异混入结果；不要把原始响应写进最终字幕目录。
+
 ### 使用本地模型 (engine=local)
 
 使用 `scripts/transcribe.py`，平台自适应引擎：
+
+英文输入需将示例中的语言和断句参数改为 `--language en --max-line-length 60 --max-line-ms 6000`；中文仍使用下方示例的中文参数。标点优先路径目前由 Groq 英文入口执行。
 
 ```bash
 venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
@@ -214,6 +229,8 @@ venv/bin/python3 scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
 
 使用 Groq 云端 `whisper-large-v3`，同时请求顶层 segments 和字符级 words：
 
+以下示例处理英文；中文输入改为 `--language zh --max-line-length 25 --max-line-ms 6000`。
+
 ```bash
 API_KEY=$(python3 -c "
 import json, os
@@ -222,12 +239,14 @@ print(json.load(open(p))['groq_api_key']
 )")
 venv/bin/python3 scripts/transcribe.py "<输出目录>/tmp/audio.src" \
   --output "<output_dir>/tmp/raw.srt" \
-  --language zh \
+  --language en \
+  --max-line-length 60 \
+  --max-line-ms 6000 \
   --engine groq \
   --groq-api-key "$API_KEY"
 ```
 
-注意事项：
+注意事项（以下 jieba、异常段评分及比例回退说明适用于中文路径；英文执行上面的独立断句策略）：
 - Groq 支持格式（FLAC、M4A、MP3、MP4、MPEG、MPGA、OGG、WAV、WEBM）且 ≤25MB 时原样上传，避免额外有损转码；超限或其他格式才转成 16kHz 单声道 Opus/OGG。不要为绕过大小限制手动转成有损格式
 - 音频超过 **25MB** 也没关系：`_compress_audio` 按时长推码率（16-128kbps）保证落在限内，超限时自动减半码率重编 ≤3 次
 - 无需 VAD 分片（API 服务端处理）
@@ -249,15 +268,17 @@ venv/bin/python3 scripts/transcribe.py "<输出目录>/tmp/audio.src" \
 1. `_clean_segments()` — 去空文本/零时长/完全重复（ASR 噪声过滤）
 2. `_segment_words()` — word-timestamp 评分引擎断句（自然停顿/溢出分割 + pending_break 回退）
 
-**Groq 路径**走 `groq_word_adapter.refine_groq_segments()`：取顶层字符级 words，对齐 segment 文本后经 jieba 聚合为词组，仅对超限 segment 复用 `_segment_words()` 评分。本地路径不变。
+**Groq 中文路径**走 `groq_word_adapter.refine_groq_segments()`：取顶层字符级 words，对齐 segment 文本后经 jieba 聚合为词组，仅对超限 segment 复用 `_segment_words()` 评分。本地路径不变。
 
-也可独立调用（仅做英文残片合并与空段过滤，不重做 word-level 评分断句）：
+**Groq 英文路径**在 `transcribe.py` 内直接调用 `refine_english_segments()`，之后运行 cleanup 并写出 SRT。不要再独立运行 `refine_segments.py`，它的混排残片合并会破坏已经选好的英文断点。`timing_review` 条目需说明，不能声称全部时间戳均已精校。
+
+`refine_segments.py` 也可独立调用，但它不做英文专用断句或合并；英文请始终走 `transcribe.py`，以保留原文标点、词级时间和专用合并规则：
 
 ```bash
 venv/bin/python3 scripts/refine_segments.py "<output_dir>/tmp/raw.srt"
 ```
 
-> 独立运行不具备 word timestamps，仅走 `_merge_fragments` 与空段过滤；如需验证评分断句能力，请走 `transcribe.py` 的内存流水线（每次转录默认输出 `<output>.words.json`）。
+> 独立运行不具备 word timestamps，仅走旧版 `_merge_fragments` 与空段过滤；不要用它校准英文断点。需要验证词级断句时走 `transcribe.py` 内存流水线（默认输出 `<output>.words.json`）。
 
 输出覆盖 `raw.srt`（时间轴无损）。算法细节见附录「断句算法」。
 
@@ -283,7 +304,7 @@ refine 的评分引擎是启发式断句。若要达到人工精校的断句质�
 1. 转写已默认生成带 word 时间戳的 segments JSON（`<输出srt>.words.json`，见 Step 2），直接读取，无需重新转录；除非想换路径，否则不用传 `--export-refined`
 2. **用 Question 工具弹窗询问用户：**
    - header: "语义断句复核"
-   - description: "是否启用 LLM 语义断句复核？耗时增加，但断句质量接近人工精校（每段约 8-18 字、在小句边界切分）"
+   - description: "是否启用 LLM 语义断句复核？中文按小句边界调整；英文限制单行，长句在可靠词级时间点拆分，不合并完整字幕。"
    - options:
      - label: "启用" → description: "运行 semantic_review.py，Agent 在安全断点内选语义断点，写回 raw.srt"
      - label: "跳过" → description: "保留评分引擎断句结果"
@@ -311,7 +332,7 @@ venv/bin/python3 scripts/semantic_review.py "<output_dir>/tmp/raw.srt.words.json
 **Step B — LLM 选断点并写回**：
 
 1. 读 splits.json，仅处理 `time_reliable=true` 的候选段
-2. 用 LLM 判断语义断点：只在 `safe_cuts` 里选（每项含 `char`/`boundary`/`start`/`end`），在小句边界切（动宾后/主语后/同位语前/语义起始词如"因为/那/你/这种"之前），每段 8-18 字
+2. 用 LLM 判断语义断点：只在 `safe_cuts` 里选（每项含 `char`/`boundary`/`start`/`end`）。中文按小句边界切；英文优先保留原标点边界，长意群按指定行长补切，不跨标点合并、不拆词，也不套用 8–18 字的中文长度要求
 3. 将选中 char 填入该段的 `selected_cuts` 数组，其他段留空
 4. 写回：
 
