@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
 """Transcribe audio using Groq's whisper-large-v3 API.
 
-Every input is normalised once to a 16kHz mono Opus (OGG) file sized to land
-under the 25MB upload cap, then sent as a single request — one upload per file
-no matter how long or what format the origin is. A file that already IS a
-16kHz mono Opus/OGG under the cap is uploaded as-is with zero transcoding.
-
-So an MP3 (typically 44.1/48kHz stereo) goes MP3 → 16kHz mono OGG in one step;
-no intermediate 16kHz WAV is produced, so there is no double conversion. This
-matters because Whisper itself works in 16kHz mono — uploading anything else
-just means the server resamples it anyway.
-
-Opus is the best space/quality tradeoff for speech among Groq's supported
-formats (FLAC/MP3/M4A/MPEG/MPGA/OGG/WAV/WEBM); 16kHz mono speech stays clear
-around 24-32kbps, roughly 3-4x denser than MP3 at equal quality. FLAC is
-lossless but barely helps and MP3 is densest only at audible quality loss, so
-Opus/OGG is fixed as the single normalisation route for every upload.
+Groq-supported files under the 25MB upload cap are sent unchanged to avoid
+unnecessary lossy re-encoding. Oversized or unsupported files are converted to
+16kHz mono Opus/OGG and sized to fit the cap.
 """
 
 import os
@@ -28,6 +16,9 @@ import requests
 
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MAX_FILE_SIZE_MB = 25
+SUPPORTED_AUDIO_SUFFIXES = {
+    ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm",
+}
 
 # Single-request compression settings (fixed codec, applied to every oversized
 # input — no format probing).
@@ -74,31 +65,17 @@ def _get_audio_info(path: str) -> dict | None:
     return None
 
 
-def _is_16k_mono_ogg(path: str) -> bool:
-    """True when the file is already a 16kHz mono Opus/OGG upload (zero conversion needed)."""
-    info = _get_audio_info(path)
-    return bool(
-        info
-        and info.get("codec") == "opus"
-        and info.get("rate") == "16000"
-        and info.get("channels") == 1
-    )
+def _can_upload_as_is(path: str, max_bytes: int) -> bool:
+    return (os.path.getsize(path) <= max_bytes
+            and os.path.splitext(path)[1].lower() in SUPPORTED_AUDIO_SUFFIXES)
 
 
 def _compress_audio(audio_path: str, max_size_mb: int = 25) -> str:
-    """Normalise any audio into a single 16kHz mono Opus (OGG) upload ≤ max_size_mb.
-
-    The only fast path is a source that already IS 16kHz mono Opus/OGG under
-    the cap — it is uploaded as-is. Everything else (MP3/WAV/M4A/FLAC/…,
-    whether it fits the cap or not) is converted to 16kHz mono Opus/OGG in one
-    ffmpeg pass. This is a single conversion from the original format: no
-    intermediate WAV is produced, so MP3s are never needlessly decoded→re-encoded
-    twice (MP3 → 16kHz WAV → Opus).
-    """
+    """Keep supported files under the cap unchanged; otherwise convert to Opus."""
     max_bytes = max_size_mb * 1024 * 1024
     file_size = os.path.getsize(audio_path)
 
-    if file_size <= max_bytes and _is_16k_mono_ogg(audio_path):
+    if _can_upload_as_is(audio_path, max_bytes):
         return audio_path
 
     duration = _get_duration(audio_path)
@@ -272,7 +249,7 @@ def _transcribe_single(
             f"converting via ffmpeg …",
             file=sys.stderr,
         )
-    elif not _is_16k_mono_ogg(audio_path):
+    elif not _can_upload_as_is(audio_path, MAX_FILE_SIZE_MB * 1024 * 1024):
         print(
             f"audio: converting {audio_path} to 16kHz mono Opus/OGG for Groq upload …",
             file=sys.stderr,

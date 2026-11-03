@@ -2,7 +2,7 @@
 
 视频/音频转录为 SRT 字幕的工具。提取音频 → Whisper 转写（本地模型或 Groq API）→ 断句/合并 → 可选润色 → 可选翻译（关键词触发），输出高精度字幕。
 
-引擎自适应：macOS arm64 默认 mlx-whisper（Apple GPU 加速），其他平台用 faster-whisper；可选 Groq API（远端 whisper-large-v3，首次运行选引擎并保存配置）。长音频自动 VAD 分片，Groq 引擎一步转 16kHz mono OGG（无论原始格式与大小，已是 OGG 则零转换直传）。
+引擎自适应：macOS arm64 默认 mlx-whisper（Apple GPU 加速），其他平台用 faster-whisper；可选 Groq API（远端 whisper-large-v3，首次运行选引擎并保存配置）。长音频自动 VAD 分片；Groq 支持且不超过 25MB 的音频原样上传，超限或不支持的格式才转成 16kHz mono Opus/OGG。
 
 在支持 Agent Skills 的 CLI 中，说「转录」+ 文件路径即可自动调用。
 
@@ -35,11 +35,11 @@ generate subtitles / generate srt / convert to srt
 输入视频/音频
      │
      ▼
-① 提取音频 (本地模型 → 16kHz WAV; Groq → 原样传入，自动转 16kHz mono OGG)
-     │
-     ├── 本地模型 ──────────  Groq API ──────────
-     │  macOS → mlx-whisper               统一转 16kHz mono OGG（libopus）
-     │  其他 → faster-whisper             已是 16kHz mono OGG 且 ≤25MB 时零转换
+① 准备音频 (本地模型 → 16kHz WAV; Groq → 原样传入)
+      │
+      ├── 本地模型 ──────────  Groq API ──────────
+      │  macOS → mlx-whisper               支持格式且 ≤25MB 时原样上传
+      │  其他 → faster-whisper             超限/不支持时转 16kHz mono OGG（libopus）
      │  可选 VAD 分片 (长音频)             返回顶层 segments + words
      ▼
 ② refine_segments.py / groq_word_adapter.py
@@ -80,10 +80,10 @@ generate subtitles / generate srt / convert to srt
 | Groq 英文碎片合并 | 自动合并 "posit"+"ion" 等跨段英文碎片 |
 | Groq 静默治理 | 段首尾静默收缩（缩至 word 边界 +0.2s）、时间重叠修正（279-500ms）、孤立短词吸收 |
 | Groq 局部回退 | words 缺失/对齐失败时按 segment 回退，不影响整份字幕 |
-| 幻觉检测 | 四规则并联：重复循环/黑名单/密度(≥15字/s 且 <1s)/质量指标(no_speech_prob≥0.8 + avg_logprob≤-1.0) |
+| 幻觉检测 | 五规则：重复循环/黑名单/密度/稀疏窗口/质量指标；每次运行写入 `<输出srt>.cleanup.json`，无清理动作时为空数组 |
 | 可选润色 | 调用 srt-enhancer 去口癖/纠错/空格 |
 | 可选翻译 | 关键词触发（翻译/重写），按源语言自动判断方向；输出纯中文或纯英文，双语仅按明确要求 |
-| 竖屏字幕输出 | 清理临时文件前可选调用 srt-enhancer 竖屏管线，输出 9:16 竖版断句字幕（每行 4-12 字、按语义边界断句、时间轴按字数比例重排） |
+| 竖屏字幕输出 | 清理临时文件前可选调用 srt-enhancer 竖屏管线；提供词级时间 JSON 且文本对齐时按真实词边界重排，否则按字数比例估时 |
 | 配置持久化 | 引擎选择、API Key 首次运行保存至 config.json |
 
 ## 文件结构
@@ -92,7 +92,8 @@ generate subtitles / generate srt / convert to srt
 video-transcribe/
 ├── scripts/          # 转写、断句、语义复核、清洗、Groq 适配、安装脚本
 ├── data/             # jieba 领域词典
-├── venv/             # Python 虚拟环境（自动创建）
+├── venv/             # 缺少依赖时创建的 Python 虚拟环境
+├── .venv/            # 旧环境无法修复时的备用虚拟环境
 ├── models/           # Whisper 模型缓存（约 1.6GB）
 ├── docs/             # 行业翻译规则
 ├── SKILL.md          # Agent skill 定义
@@ -101,15 +102,18 @@ video-transcribe/
 
 ## 依赖
 
-**必需：** ffmpeg、Python 3.8+
+**必需：** ffmpeg、Python 3.10+
+
+依赖按引擎初始化：Windows PowerShell 运行 `./scripts/setup.ps1 --engine groq` 或 `--engine local`；macOS/Linux 运行 `bash scripts/setup.sh --engine groq` 或 `--engine local`。本机 Python 已有全部依赖时直接复用；缺少依赖时在技能目录建 venv，不污染系统 Python。使用引导器输出的 `Python executable` 路径运行后续脚本。
 
 **转录引擎（至少选一个）：**
 - mlx-whisper（macOS arm64 本地模型）
 - faster-whisper（其他平台本地模型）
 - requests + API Key（Groq API）
 
-**中文分词（Groq 模式）：**
-- jieba 0.42.1 + 领域词典（`data/jieba_domain_dict.txt`，未找到时降级为默认词典并 warning）
+**转录与中文断句：**
+- jieba 0.42.1 + 领域词典（`data/jieba_domain_dict.txt`，缺词典时降级为默认词典）
+- numpy（音频静默边缘校准；缺失时保留原始时间戳）
 
 **本地模型优化（可选，失败自动降级）：**
 - silero-vad-notorch + onnxruntime（macOS 长音频 VAD 预分片）

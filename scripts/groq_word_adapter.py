@@ -221,6 +221,10 @@ def _build_char_time_map(seg_text: str, groq_words: list[dict]) -> dict:
     groq_times = []
     for w in groq_words:
         for ch in w["word"]:
+            # Units may carry a preserved word gap as a leading space; the
+            # text side is compared with spaces removed, so drop them here too.
+            if ch.isspace():
+                continue
             groq_concat += ch
             groq_times.append((w["start"], w["end"]))
     text_no_ws = seg_text.replace(" ", "").replace("\u200b", "")
@@ -246,6 +250,15 @@ def _build_char_time_map(seg_text: str, groq_words: list[dict]) -> dict:
         if ch.isspace():
             continue
         if ch in _PUNCT:
+            # Punctuation the ASR emitted ("Ok,") occupies a Groq index like
+            # any other char; punctuation it never emitted does not. Not
+            # advancing the index shifted every later char by one, which put
+            # English word boundaries mid-word ("tto explo").
+            if ch in _norm_char_set:
+                if gi < len(groq_times):
+                    result[orig_i] = groq_times[gi]
+                gi += 1
+                continue
             if gi > 0 and gi - 1 < len(groq_times):
                 result[orig_i] = groq_times[gi - 1]
             elif gi < len(groq_times):
@@ -289,6 +302,11 @@ def _build_phrased_units(seg_text: str, char_times: dict) -> list[dict]:
         char_end_t = char_times.get(end - 1) if end - 1 >= start else char_times.get(start)
         if char_start_t is None or char_end_t is None:
             return []
+        # Line assembly joins units with "" (right for Chinese, which needs no
+        # separator), so a dropped word gap would glue English words together
+        # ("there" + "are" -> "thereare"). Keep the gap as a leading space.
+        if start > 0 and seg_text[start - 1].isspace():
+            word = " " + word
         units.append({
             "word": word,
             "start": char_start_t[0],
@@ -316,6 +334,11 @@ def _protect_technical_tokens(units: list[dict]) -> list[dict]:
         prev_text = prev["word"].strip()
         curr_text = u["word"].strip()
         if not prev_text or not curr_text:
+            merged.append(u)
+            continue
+        # A preserved word gap means these are two separate words already —
+        # merging them is what cut English in half ("telescope" + " and").
+        if u["word"][:1].isspace():
             merged.append(u)
             continue
         is_prev_ascii = _is_ascii_ident(prev_text)
@@ -721,8 +744,11 @@ def _split_at_silence(
         c_end = chunk_words[-1]["end"]
         chunk_phrased = [u for u in phrased if u["start"] >= c_start - 0.05 and u["end"] <= c_end + 0.05]
         if not chunk_phrased:
-            # Fallback: use word strings directly
-            text_piece = "".join(w.get("word", "") for w in chunk_words)
+            # Fallback: use word strings directly, keeping the word gaps —
+            # a plain join glued English words ("andthen").
+            text_piece = ""
+            for w in chunk_words:
+                text_piece = _join_text(text_piece, w.get("word", ""))
         else:
             text_piece = "".join(u.get("word", "") for u in chunk_phrased)
         text_piece = text_piece.strip()
@@ -818,6 +844,12 @@ def _split_seg_with_words(
     if (combined_text.replace(" ", "").replace("\u200b", "")
             != seg["text"].replace(" ", "").replace("\u200b", "")):
         return [seg]
+    # Groq word spans bleed past the segment window (a 0-16s window whose
+    # words end at 16.06s). Clamp rather than reject: a rejected split falls
+    # back to ratio cuts that land mid-word ("tto explo").
+    for l in lines:
+        l["start"] = max(l["start"], seg.get("start", l["start"]))
+        l["end"] = min(l["end"], seg.get("end", l["end"]))
     # Verify mutation integrity — fallback on failure
     if not _verify_text(lines, seg["text"]):
         print(f"warning: split text mismatch for segment {seg.get('start'):.2f}s, fallback",
@@ -851,14 +883,33 @@ def _leading_ascii(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _is_delimited(text: str, token: str, at_end: bool) -> bool:
+    """True when token sits next to whitespace, ASCII punctuation or a text
+    edge — i.e. a whole word rather than a slice of a longer word. CJK
+    neighbours mean the token is glued into a CJK run (``加个de``)."""
+    pos = text.rfind(token) if at_end else text.find(token)
+    if pos < 0:
+        return False
+    if at_end:
+        return pos == 0 or _is_word_edge(text[pos - 1])
+    return pos + len(token) == len(text) or _is_word_edge(text[pos + len(token)])
+
+
+def _is_word_edge(ch: str) -> bool:
+    return ch.isspace() or (ch.isascii() and not ch.isalnum())
+
+
 def _join_boundary(prev_text: str, nxt_text: str, trailing: str, leading: str) -> str:
     """Join two segments split inside/around an English phrase.
 
-    Insert a space only when the boundary tokens look like two complete words
-    (Rookie + Awards) or a capitalised new word follows lowercase; short
-    fragments (de + saturation, off + er) rejoin without a space.
+    Insert a space when the boundary tokens are whole words (Rookie + Awards,
+    start to + explore how) or a capitalised word follows lowercase; fragments
+    sliced out of one word (de + saturation, off + er) rejoin without a space.
     """
     if leading[0].isupper() and trailing[-1].islower():
+        return prev_text + " " + nxt_text
+    if (_is_delimited(prev_text.strip(), trailing, at_end=True)
+            and _is_delimited(nxt_text.strip(), leading, at_end=False)):
         return prev_text + " " + nxt_text
     if len(trailing) > 3 and len(leading) > 3:
         return prev_text + " " + nxt_text
@@ -1032,7 +1083,10 @@ def _merge_fragments_groq(segments: list[dict], energy=None) -> list[dict]:
                 break
             if _crumb_gap(last, nxt) > _MERGE_CRUMB_GAP_S:
                 break
-            buf_text += nxt_text
+            # Crumbs cut at a word boundary need their gap back; crumbs with
+            # no word timestamps are mid-word slices and must stay glued.
+            buf_text = (_join_text(buf_text, nxt_text) if nxt.get("words")
+                        else buf_text + nxt_text)
             buf_end = nxt["end"]
             buf_words.extend(nxt.get("words", []))
             last = nxt

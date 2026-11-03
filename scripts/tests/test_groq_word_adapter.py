@@ -105,6 +105,21 @@ class TestCharTimeMap(unittest.TestCase):
         ct = _build_char_time_map(text, words)
         self.assertEqual(ct, {})
 
+    def test_emitted_punctuation_consumes_a_word_index(self):
+        """Regression: "Ok," made every later char one index early, which put
+        English word boundaries mid-word."""
+        text = "Ok, now let's start"
+        words = [
+            {"word": "Ok,", "start": 11.72, "end": 12.0},
+            {"word": "now", "start": 12.0, "end": 12.32},
+            {"word": "let's", "start": 12.32, "end": 12.7},
+            {"word": "start", "start": 12.7, "end": 13.04},
+        ]
+        ct = _build_char_time_map(text, words)
+        self.assertEqual(ct[4], (12.0, 12.32))   # n of "now"
+        self.assertEqual(ct[8], (12.32, 12.7))   # l of "let's"
+        self.assertEqual(ct[14], (12.7, 13.04))  # s of "start"
+
 
 class TestCoverage(unittest.TestCase):
 
@@ -149,6 +164,20 @@ class TestPhrasedUnits(unittest.TestCase):
         ]
         ct = _build_char_time_map(text, words)
         units = _build_phrased_units(text, ct)
+        self.assertTrue(_verify_text(units, text))
+
+    def test_english_word_gaps_survive_reassembly(self):
+        """Regression: dropped gaps glued English words into "thereare"."""
+        text = "I think there are three important questions we should ask ourselves."
+        words = []
+        t = 0.0
+        for token in text.split(" "):
+            words.append({"word": token, "start": t, "end": t + 0.3})
+            t += 0.3
+        ct = _build_char_time_map(text, words)
+        units = _protect_technical_tokens(_build_phrased_units(text, ct))
+        joined = "".join(u["word"] for u in units)
+        self.assertEqual(joined, text)
         self.assertTrue(_verify_text(units, text))
 
 

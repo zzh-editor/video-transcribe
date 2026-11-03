@@ -11,7 +11,7 @@
 
 ## Groq 路径（`transcribe.py:453-515`）
 
-1. `transcribe_groq()`：音频归一化为 16kHz 单声道 Opus/OGG，≤25MB（`_compress_audio` 按时长推 16-128kbps），单请求 `verbose_json` + `segment`/`word` 双粒度。
+1. `transcribe_groq()`：Groq 支持且≤25MB的音频原样上传；超限或不支持的格式转为16kHz单声道Opus/OGG并压至限制内。单请求使用 `verbose_json` + `segment`/`word` 双粒度。
 2. `_clean_segments()` 去空段 + `_merge_fragments()` 修跨段断词。
 3. `refine_groq_segments()`（`groq_word_adapter.py`）主切分引擎。
 4. `cleanup_segments()` 幻觉/重复清理。
