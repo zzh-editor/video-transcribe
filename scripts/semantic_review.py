@@ -2,14 +2,16 @@
 """
 LLM 语义断句复核辅助脚本（Step 3.5）。
 
-解决三批问题：
+解决四批问题：
   1. 英文断点切词 —— modular/mouse 被从中间切开
   2. 中文断点切词 —— 断点落在 jieba 词内部
-  3. 临时脚本重复编写 —— 每次手写 split_map / 应用脚本
+  3. 相邻残句 —— ASR 把一句话切成「它可以 blend」/「这个底下」
+  4. 临时脚本重复编写 —— 每次手写 split_map / 应用脚本
 
 核心思路：
   把「切分点安全性」和「时间戳计算」从 LLM 手里拿回来，交给确定性代码保证。
-  LLM 只负责从 safe_cuts 里「选哪个语义最合适」，不再造切分点 + 算时间戳。
+  LLM 只负责从 safe_cuts 里「选哪个语义最合适」，并从 merge_candidates 里选
+  可安全合并的原始相邻条目；不再造切分点 + 算时间戳。
 
 输入的 words.json 是 transcribe.py 每次转录默认产出（<srt>.words.json）。
 Groq 的 words 为字符级/词组级，可能与 text 不完全逐字对齐（错序、错切，
@@ -35,8 +37,13 @@ splits.json 结构：
       "safe_cuts": [
         {"char": 8, "boundary": "词︱词", "start": 3.42, "end": 5.01}
       ],
-      "selected_cuts": [8, 15]
-    }
+       "selected_cuts": [8, 15]
+     }
+   },
+   "_merge_candidates": [
+     {"segments": [26, 27], "reason": "continuation", "text": "..."}
+   ],
+   "_selected_merges": [[26, 27]]
   }
 
   words 缺失但含换行（\\n）的段：Groq 返回的多行 text 在 transcribe 阶段因无
@@ -70,6 +77,17 @@ WEAK_PUNCT = frozenset("，、；：,;:")
 # 英文 token：连续的字母/数字/常见符号视为一个不可切整体
 EN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+\-#&/]*")
 
+# These starts are usually syntactic continuations, not a fresh subtitle idea.
+# They are only used to propose a merge to the LLM; applying a merge still
+# requires an explicit selection in splits.json.
+CONTINUATION_START_RE = re.compile(
+    r"^(?:的|地|得|了|着|过|吧|吗|呢|啊|呀|去|来|到|在|把|被|"
+    r"这个|那个|这样|怎么|什么|可以|会|要|就|还|再|也|而|并|加|掉)"
+)
+MERGE_MAX_CHARS = 30
+MERGE_MAX_DUR_S = 5.5
+MERGE_MAX_GAP_S = 0.35
+
 
 def _visible(s: str) -> str:
     return s.replace(" ", "").replace("\u200b", "")
@@ -81,6 +99,51 @@ def _is_cn(ch: str) -> bool:
 
 def _has_punct(text: str) -> bool:
     return any(ch in CN_PUNCT for ch in text)
+
+
+def _merge_candidates(segs: list[dict]) -> list[dict]:
+    """Offer adjacent continuation groups for review without auto-merging.
+
+    The ASR boundary is weak evidence for Chinese speech. A short next cue that
+    starts with a particle, demonstrative, or verb often continues the prior
+    cue. Keep candidates bounded so the reviewer never turns a paragraph into
+    one subtitle.
+    """
+    candidates = []
+    for start in range(len(segs) - 1):
+        first = segs[start]
+        first_text = first["text"].strip()
+        if not first_text or first_text[-1:] in STRONG_PUNCT:
+            continue
+
+        merged = first_text
+        end = start
+        for nxt in segs[start + 1:start + 4]:
+            nxt_text = nxt["text"].strip()
+            # 「就是」通常是在开启一个解释，而不是补全前一条；把它和
+            # continuation 的单字「就」区分开，避免误合并独立教学句。
+            if (not nxt_text or nxt_text.startswith("就是")
+                    or not CONTINUATION_START_RE.match(nxt_text)):
+                break
+            previous = segs[end]
+            previous_text = previous["text"].strip()
+            if previous_text[-1:] in STRONG_PUNCT:
+                break
+            gap = nxt["start"] - previous["end"]
+            proposed = merged + nxt_text
+            if (gap > MERGE_MAX_GAP_S or len(_visible(proposed)) > MERGE_MAX_CHARS
+                    or nxt["end"] - first["start"] > MERGE_MAX_DUR_S):
+                break
+            merged = proposed
+            end += 1
+            candidates.append({
+                "segments": [segs[start]["index"], segs[end]["index"]],
+                "reason": "continuation",
+                "text": merged,
+                "gap_ms": round(gap * 1000),
+                "visible_len": len(_visible(merged)),
+            })
+    return candidates
 
 
 # ── 候选筛选 ──────────────────────────────────────────────────────
@@ -438,16 +501,54 @@ def generate(words_path: str, srt_path: str) -> dict:
             "selected_cuts": [],
             **({"time_mode": "proportional"} if newline_prop else {}),
         }
+    plan["_merge_candidates"] = _merge_candidates(srt_segs)
+    plan["_selected_merges"] = []
     return plan
 
 
+def _join_caption_text(left: str, right: str) -> str:
+    """Join two cue texts without introducing a CJK/Latin spacing regression."""
+    left, right = left.strip(), right.strip()
+    if (left and right and (
+            (left[-1].isascii() and left[-1].isalnum()
+             and (right[0].isascii() and right[0].isalnum() or _is_cn(right[0])))
+            or (_is_cn(left[-1]) and right[0].isascii() and right[0].isalnum()))):
+        return left + " " + right
+    return left + right
+
+
+def _selected_merge_ranges(plan: dict, segs: list[dict]) -> dict[int, int]:
+    """Validate explicit merge choices and return {first_index: last_index}."""
+    positions = {seg["index"]: pos for pos, seg in enumerate(segs)}
+    ranges = {}
+    claimed = set()
+    for chosen in plan.get("_selected_merges", []):
+        if not isinstance(chosen, list) or len(chosen) != 2:
+            continue
+        first, last = chosen
+        if not isinstance(first, int) or not isinstance(last, int) or first >= last:
+            continue
+        members = set(range(first, last + 1))
+        if first not in positions or last not in positions or members & claimed:
+            continue
+        pos = positions[first]
+        if [seg["index"] for seg in segs[pos:pos + len(members)]] != list(range(first, last + 1)):
+            continue
+        ranges[first] = last
+        claimed |= members
+    return ranges
+
+
 def apply(srt_path: str, plan_path: str) -> list[str]:
-    plan = json.load(open(plan_path, encoding="utf-8"))
+    with open(plan_path, encoding="utf-8") as f:
+        plan = json.load(f)
     srt_segs = _parse_srt(srt_path)
     index_map = {seg["index"]: seg for seg in srt_segs}
     word_map = {}
 
     for idx_str, info in plan.items():
+        if idx_str.startswith("_"):
+            continue
         idx = int(idx_str)
         cuts = info.get("selected_cuts") or []
         if not cuts or not info.get("time_reliable"):
@@ -486,9 +587,28 @@ def apply(srt_path: str, plan_path: str) -> list[str]:
             for txt, t0, t1 in pieces
         ]
 
+    merge_ranges = _selected_merge_ranges(plan, srt_segs)
+    by_index = {seg["index"]: seg for seg in srt_segs}
     out = []
     counter = 0
-    for seg in srt_segs:
+    i = 0
+    while i < len(srt_segs):
+        seg = srt_segs[i]
+        merge_end = merge_ranges.get(seg["index"])
+        if merge_end is not None:
+            group = [by_index[idx] for idx in range(seg["index"], merge_end + 1)]
+            # A selected merge must operate on original cues. Splitting a cue
+            # and then merging it would discard the reviewed split boundary.
+            if not any(member.get("split") for member in group):
+                text = group[0]["text"]
+                for member in group[1:]:
+                    text = _join_caption_text(text, member["text"])
+                counter += 1
+                out.append(
+                    f"{counter}\n{group[0]['raw_start']} --> {group[-1]['raw_end']}\n{text}\n"
+                )
+                i += len(group)
+                continue
         sub = seg.get("split")
         if sub:
             for piece in sub:
@@ -497,6 +617,7 @@ def apply(srt_path: str, plan_path: str) -> list[str]:
         else:
             counter += 1
             out.append(f"{counter}\n{seg['raw_start']} --> {seg['raw_end']}\n{seg['text']}\n")
+        i += 1
     return out
 
 
@@ -524,12 +645,16 @@ def main():
     plan = generate(args.input, args.srt)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(plan, f, ensure_ascii=False, indent=1)
-    total = len(plan)
-    reliable = sum(1 for v in plan.values() if v["time_reliable"])
+    segment_plan = {k: v for k, v in plan.items() if not k.startswith("_")}
+    total = len(segment_plan)
+    reliable = sum(1 for v in segment_plan.values() if v["time_reliable"])
     print(f"候选段 {total}（时间可靠 {reliable}）→ {args.output}")
-    for k, v in plan.items():
+    for k, v in segment_plan.items():
         flag = "" if v["time_reliable"] else " [⏱不可靠]"
         print(f"  #{k}: {v['reason']} {len(v['text'])}字 safe_cuts={len(v['safe_cuts'])}{flag} | {v['text'][:26]}")
+    candidates = plan["_merge_candidates"]
+    if candidates:
+        print(f"相邻合并候选 {len(candidates)} 条（需复核后填入 _selected_merges）")
 
 
 if __name__ == "__main__":

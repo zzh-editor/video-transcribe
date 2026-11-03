@@ -92,7 +92,8 @@ generate subtitles / generate srt / convert to srt
 video-transcribe/
 ├── scripts/          # 转写、断句、语义复核、清洗、Groq 适配、安装脚本
 ├── data/             # jieba 领域词典
-├── venv/             # Python 虚拟环境（自动创建）
+├── venv/             # 缺少依赖时创建的 Python 虚拟环境
+├── .venv/            # 旧环境无法修复时的备用虚拟环境
 ├── models/           # Whisper 模型缓存（约 1.6GB）
 ├── docs/             # 行业翻译规则
 ├── SKILL.md          # Agent skill 定义
@@ -101,15 +102,18 @@ video-transcribe/
 
 ## 依赖
 
-**必需：** ffmpeg、Python 3.8+
+**必需：** ffmpeg、Python 3.10+
+
+依赖按引擎初始化：Windows PowerShell 运行 `./scripts/setup.ps1 --engine groq` 或 `--engine local`；macOS/Linux 运行 `bash scripts/setup.sh --engine groq` 或 `--engine local`。本机 Python 已有全部依赖时直接复用；缺少依赖时在技能目录建 venv，不污染系统 Python。使用引导器输出的 `Python executable` 路径运行后续脚本。
 
 **转录引擎（至少选一个）：**
 - mlx-whisper（macOS arm64 本地模型）
 - faster-whisper（其他平台本地模型）
 - requests + API Key（Groq API）
 
-**中文分词（Groq 模式）：**
-- jieba 0.42.1 + 领域词典（`data/jieba_domain_dict.txt`，未找到时降级为默认词典并 warning）
+**转录与中文断句：**
+- jieba 0.42.1 + 领域词典（`data/jieba_domain_dict.txt`，缺词典时降级为默认词典）
+- numpy（音频静默边缘校准；缺失时保留原始时间戳）
 
 **本地模型优化（可选，失败自动降级）：**
 - silero-vad-notorch + onnxruntime（macOS 长音频 VAD 预分片）
