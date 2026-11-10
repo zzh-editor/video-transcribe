@@ -627,6 +627,7 @@ def main():
     ap.add_argument("srt", nargs="?", help="raw.srt（默认模式）")
     ap.add_argument("-o", "--output", default="splits.json")
     ap.add_argument("--apply", action="store_true", help="应用 selected_cuts 写回")
+    ap.add_argument("--compact-llm-view", action="store_true", help="仅保留带 [1]、[2] 切点标记的紧凑文本与必要索引，剔除冗余词级浮点时间戳以节省 Token")
     args = ap.parse_args()
 
     if args.apply:
