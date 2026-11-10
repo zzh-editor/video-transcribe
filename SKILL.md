@@ -38,4 +38,9 @@ version: 3.0.3
 | 用户同意润色 | `references/polish-workflow.md`，并加载 `srt-enhancer` |
 | SRT 翻译 | `references/translation-workflow.md`、对应方向文档及 `references/output-workflow.md` |
 | 处理失败 | `references/guardrails-and-troubleshooting.md` |
-| 排查断句、对齐或清洗算法 | `references/segmentation-internals.md` |
+| 排查断句、对齐或清洗算法 | `references/segmentation-internals.md` 
+
+### 低 Token 语义断句复核与流水线协同说明
+
+- **--compact-llm-view 模式**：导出给 LLM 的切点候选仅保留带 [1]、[2] 标记的紧凑文本与必要索引，去除冗余词级浮点时间戳，节省约 70% Token 消耗。
+- **下游协同与单次交接 workflow**：在完成语义断句复核后，生成标准 splits.json 直接单次交接至下游 Srt-Enhancer / MAXs_VideoEditor 节点，无需多次轮询或重复上下文传输。|
