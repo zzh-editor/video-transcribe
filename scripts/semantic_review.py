@@ -539,6 +539,54 @@ def _selected_merge_ranges(plan: dict, segs: list[dict]) -> dict[int, int]:
     return ranges
 
 
+def compact_view(plan: dict) -> str:
+    """Render a token-lean view of splits.json for LLM review.
+
+    只保留候选段文字、段内切点标号和合并候选；丢弃 words 级浮点时间戳、
+    boundary 回显和 start/end 区间。标记写成 [k@char]：k 是段内标号，
+    char 是回填 selected_cuts 时要用的字符下标。
+    """
+    lines = [
+        "# splits.json 紧凑视图。标记 [k@char]：k=段内切点标号，char=回填 selected_cuts 的字符下标。",
+        "# 选点：把挑中的 char 填进对应段的 selected_cuts；合并：把相邻段号写进 _selected_merges，如 [[1,2]]。",
+        "# 标记不属于字幕文字。",
+    ]
+    for key, info in plan.items():
+        if key.startswith("_"):
+            continue
+        marks = {}
+        for number, cut in enumerate(info.get("safe_cuts", []), 1):
+            if cut.get("char") is not None:
+                marks[cut["char"]] = number
+        if not marks:
+            continue
+        text = info.get("text", "")
+        rendered = []
+        for pos, char in enumerate(text):
+            if pos in marks:
+                rendered.append(f"[{marks[pos]}@{pos}]")
+            rendered.append(char)
+        flags = ",".join(info.get("reason", []))
+        reliability = "" if info.get("time_reliable") else " 时间不可靠"
+        lines.append(
+            f"#{key} {flags} {info.get('visible_len', 0)}字 "
+            f"cuts={len(marks)}{reliability}"
+        )
+        lines.append("".join(rendered).replace("\n", "⏎"))
+    candidates = plan.get("_merge_candidates") or []
+    if candidates:
+        lines.append("# 相邻合并候选")
+        for item in candidates:
+            segments = item.get("segments") or []
+            if len(segments) != 2:
+                continue
+            lines.append(
+                f"merge {segments[0]}-{segments[1]} {item.get('reason', '')} "
+                f"gap={item.get('gap_ms', 0)}ms {item.get('visible_len', 0)}字"
+            )
+    return "\n".join(lines) + "\n"
+
+
 def apply(srt_path: str, plan_path: str) -> list[str]:
     with open(plan_path, encoding="utf-8") as f:
         plan = json.load(f)
@@ -631,6 +679,9 @@ def main():
     args = ap.parse_args()
 
     if args.apply:
+        if args.compact_llm_view:
+            print("错误：--compact-llm-view 只用于生成模式，不能和 --apply 同用", file=sys.stderr)
+            sys.exit(2)
         if not args.srt:
             print("错误：--apply 需要一个 .srt 路径作为第二个参数", file=sys.stderr)
             sys.exit(2)
@@ -651,11 +702,18 @@ def main():
     reliable = sum(1 for v in segment_plan.values() if v["time_reliable"])
     print(f"候选段 {total}（时间可靠 {reliable}）→ {args.output}")
     for k, v in segment_plan.items():
-        flag = "" if v["time_reliable"] else " [⏱不可靠]"
+        flag = "" if v["time_reliable"] else " [时间不可靠]"
         print(f"  #{k}: {v['reason']} {len(v['text'])}字 safe_cuts={len(v['safe_cuts'])}{flag} | {v['text'][:26]}")
     candidates = plan["_merge_candidates"]
     if candidates:
         print(f"相邻合并候选 {len(candidates)} 条（需复核后填入 _selected_merges）")
+    if args.compact_llm_view:
+        compact_path = Path(args.output).with_suffix(".llm.txt")
+        view = compact_view(plan)
+        compact_path.write_text(view, encoding="utf-8")
+        json_size = Path(args.output).stat().st_size
+        saved = 0 if not json_size else round((1 - compact_path.stat().st_size / json_size) * 100)
+        print(f"紧凑 LLM 视图 → {compact_path}（较 splits.json 少 {saved}% 字节）")
 
 
 if __name__ == "__main__":

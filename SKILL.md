@@ -42,5 +42,5 @@ version: 3.0.3
 
 ### 低 Token 语义断句复核与流水线协同说明
 
-- **--compact-llm-view 模式**：导出给 LLM 的切点候选仅保留带 [1]、[2] 标记的紧凑文本与必要索引，去除冗余词级浮点时间戳，节省约 70% Token 消耗。
-- **下游协同与单次交接 workflow**：在完成语义断句复核后，生成标准 splits.json 直接单次交接至下游 Srt-Enhancer / MAXs_VideoEditor 节点，无需多次轮询或重复上下文传输。|
+- **--compact-llm-view 模式**：生成 splits.json 的同时额外写出 `<output>.llm.txt`，只保留候选段文字、段内切点标号 `[k@char]` 和合并候选，丢弃 boundary 回显与 word 级浮点时间戳。用法：`python scripts/semantic_review.py raw.srt.words.json raw.srt -o tmp/splits.json --compact-llm-view`。复核时只读 `.llm.txt`，把选中标号的 char 填进 splits.json 对应段的 `selected_cuts`；`--apply` 仍需读完整 splits.json。
+- **下游协同与单次交接 workflow**：语义断句复核完成后直接以 splits.json 作为唯一交接物，不再重复轮询或回传上下文。注意 splits.json（`{idx: {safe_cuts:[...]}}`）与 Srt-Enhancer `vertical.py --splits`（`{idx: [chunk,...]}`）是两个 schema：交给竖屏断句前需把选定切点转成分块文案，或直接传 `--words-json` 让竖屏脚本自行分块。
