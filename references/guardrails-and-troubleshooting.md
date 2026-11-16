@@ -11,7 +11,7 @@
 | 7 | 未经用户确认安装 srt-enhancer | 安装应由用户决定 | 意外修改用户环境，可能与已有版本冲突 |
 | 8 | 跳过 srt-enhancer 子步骤（省略 domain detection 或 web calibration） | 联网校准是术语准确性的关键保障 | 术语靠 AI 猜测，错别字/ASR 误识别无法修正，字幕质量下降 |
 | 9 | Step 4 完成后不验证 srt-enhancer 输出 | 润色结果可能不完整 | 低质量字幕被当作最终结果，用户无法察觉缺失的修正 |
-| 10 | 在对话中打印 Groq API Key | API Key 可能被日志记录或泄露 | 只在需要时从 config.json 读取，不在命令或对话中明文显示 |
+| 10 | 在对话中打印 Groq API Key | API Key 可能被日志记录或泄露 | 从 `GROQ_API_KEY` 或调用方安全传入的环境变量读取，不在命令或对话中明文显示 |
 | 11 | 下载 Whisper 模型前不检查磁盘空间 | 1.6GB 模型可能因空间不足下载失败 | 检查可用空间 ≥3GB 后再下载 |
 | 12 | 中译英完成后跳过术语验证或静默替换 | 术语验证是领域术语准确性的最后栅栏 | 原始术语挪用（big studio/HR department）进入输出，行业观众读着出戏 |
 
@@ -20,7 +20,7 @@
 ### 必需
 - **ffmpeg**：音频提取
 - **Python 3.10+**：运行转录脚本；缺少 Python 时需先安装，虚拟环境不能替代 Python 解释器
-- **依赖引导**：macOS/Linux 用 `bash scripts/setup.sh --engine groq|local`，Windows PowerShell 用 `./scripts/setup.ps1 --engine groq|local`；本机已有全部依赖时直接复用，否则创建或修复技能虚拟环境并只装缺项，不向系统 Python 全局安装
+- **依赖引导**：macOS/Linux 用 `bash scripts/setup.sh --engine groq|local`，Windows PowerShell 用 `./scripts/setup.ps1 --engine groq|local`；当前 Python 环境已有全部依赖时直接复用，否则创建或修复技能虚拟环境并只装缺项，不向系统 Python 全局安装
 - **Groq / 对齐**：`requests`、`jieba==0.42.1`、`numpy`
 
 ### 转录引擎（至少选一个）
@@ -43,7 +43,7 @@
 - Silero VAD ONNX 约 2.3MB（VAD 优化使用）
 
 ### 可选
-- **srt-enhancer**：独立润色技能，位于 `~/.config/opencode/skills/srt-enhancer/`
+- **srt-enhancer**：通过当前 Agent 的 Skill 加载能力发现；脚本路径相对加载结果返回的 skill root
 
 ## 临时文件
 
@@ -68,7 +68,7 @@ AI 处理完成后可清理 `tmp/` 目录。
 | VAD 分片失败（onnxruntime 推理异常） | 跳过 VAD | 降级为整段 Whisper 转录（无 VAD 分片） |
 | VAD 分片后无有效语音段 | 检查音频是否为纯音乐/噪音 | 自动降级为整段转录 |
 | 转写内存不足 | 关闭其他应用后重试 | 确保 8GB+ RAM |
-| srt-enhancer 不存在 | 用 Question 询问用户是否安装（`npx skills@latest install https://github.com/zzh-editor/Srt-Enhancer`） | 用户同意则安装后进入 Step 4，拒绝则跳过润色 |
+| 当前 Agent 的技能加载机制无法加载 srt-enhancer | 本地媒体流程在开场润色问卷中询问是否安装 | 用户同意后运行安装命令并再次尝试加载；拒绝、安装失败或仍无法加载时跳过润色 |
 | srt-enhancer 安装失败 | 检查网络和 npx 是否可用 | 跳过润色，以 raw.srt 为基线 |
 | srt-enhancer 调用失败 | 检查 enhance.py 日志输出 | 跳过润色，以 raw.srt 为基线 |
 | srt-enhancer 输出异常（空文件/乱码） | 检查 enhance.py 日志输出 | 跳过润色，以 raw.srt 为基线 |
@@ -77,16 +77,16 @@ AI 处理完成后可清理 `tmp/` 目录。
 | 联网校准搜索结果无权威来源 | 跳过该术语修正，标注 ❗ | 保留原文，标记 `#unverified` |
 | srt-enhancer 子步骤被跳过（未执行 domain detection 或 web calibration） | 回退到 Step 4 重新执行完整子步骤清单 | 跳过润色，以 raw.srt 为基线 |
 | AI 翻译执行失败（上下文超限/超时/输出格式异常） | 减小每批翻译量（每次 5 条 SRT 条目）、重试 | 跳过翻译，以未翻译的 final.srt 作为最终输出 |
-| 竖屏输出失败（vertical.py 报错/计划缺失） | 用 vertical.py 的 `--max-chars` 硬切回退 | 跳过竖屏输出，仍清理 tmp/ 并告知用户 |
-| Groq API 文件 >25MB | 无需处理，直接传原始文件，`_compress_audio` 自动转 16kHz mono OGG 并按时长推码率降到限内 | 转码后仍超限 → 用 Question 询问是否切换本地模型 |
-| Groq API Key 无效 (401) | 提示检查 API Key | 用 Question 询问是否重新输入 Key |
+| 竖屏输出失败（`vertical.py` 报错/计划缺失） | 用 `vertical.py --max-chars` 硬切回退 | 跳过竖屏输出，仍清理 tmp/ 并告知用户 |
+| Groq API 文件 >25MB | 无需处理，直接传原始文件，`_compress_audio` 自动转 16kHz mono OGG 并按时长推码率降到限内 | 转码后仍超限 → 询问是否切换本地模型 |
+| Groq API Key 无效 (401) | 提示检查 API Key | 询问是否重新输入 Key |
 | Groq 网络超时 (600s) | 提示连接超时 | 建议切换本地模型 |
 | Groq 速率限制 (429) | 提示频率超限，稍后再试 | 建议切换本地模型 |
 | Groq API 连接失败 | 检查网络连接 | 建议切换本地模型 |
 | `requests` 未安装（Groq 模式） | 运行平台对应的 setup 脚本并指定 `--engine groq` | 安装失败时报告 pip 错误；不回退到全局 pip |
 | `import jieba` 失败（中文断句） | 运行平台对应的 setup 脚本并指定 `--engine groq` | 安装失败时停止并保留原始 SRT，不静默声称完成分词重切 |
 | `numpy` 未安装（音频对齐） | 运行平台对应的 setup 脚本并指定 `--engine groq` | 对齐可降级并保留原时间戳；之后补装并重试 |
-| config.json 损坏或格式无效 | 提示检查 JSON 格式，展示预期结构 | 用 Question 询问是否重新执行引擎选择流程 |
+| `VIDEO_TRANSCRIBE_CONFIG` 指向的 JSON 损坏或格式无效 | 报告配置文件路径和 JSON 错误 | 重新询问引擎设置；不要静默回退到默认引擎 |
 | Groq 中文 prompt 被复述为幻觉（实测：`请准确转写专业术．保持简体中文。` 在全片静音段出现 20+ 处，no_speech_prob/avg_logprob 均正常，无法被质量指标识别） | 默认不传 prompt（`DEFAULT_GROQ_PROMPT=None`），如需传只传英文 prompt（实测英文 prompt 无复述幻觉但也无术语改善）；黑名单锚点 `请准确转写专业`/`保持简体中文` 清除残留 | 术语错识靠润色环节 correction-table 修正，不依赖 prompt |
 | Groq 静音窗口包含短词段（≤3 字符却 4-11s，如 `OK`/`然后`/`对然后`，word 时间戳覆盖整个窗口不可靠） | `_absorb_isolated_crumbs` 将孤立短词吸收进无缝衔接的后段（gap≤0.5s） | 保持原样（文本正确，仅时间轴未精确收缩） |
 | Groq 正常段跨大段静默合并（实测 19 处 1.5-16s，如 #87 2.3s/#167 5.9s/#394 6.9s 合并为单条双行字幕） | `_should_force_split` 检 `max_internal_gap>0.80s` → `_split_at_silence` 硬切（绕过 MIN_LINE_CHARS），剩余超长片再评分细切 | `_fallback_split` 标点比率兜底 |

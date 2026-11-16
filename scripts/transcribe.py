@@ -100,23 +100,6 @@ def _normalize_segments(segments: list) -> list[dict]:
     return out
 
 
-# ── Model cache migration ──────────────────────────────────────────
-def _migrate_model_cache(models_dir: str):
-    default_hub = Path.home() / ".cache/huggingface/hub"
-    old_model_dir = default_hub / "models--mlx-community--whisper-large-v2-mlx"
-    new_hub = Path(models_dir) / "hub"
-    new_model_dir = new_hub / "models--mlx-community--whisper-large-v2-mlx"
-
-    if old_model_dir.exists() and not new_model_dir.exists():
-        new_hub.mkdir(parents=True, exist_ok=True)
-        os.symlink(
-            str(old_model_dir.resolve()),
-            str(new_model_dir.resolve()),
-            target_is_directory=True,
-        )
-        print(f"model cache: symlinked existing model → {new_model_dir}", file=sys.stderr)
-
-
 # ── VAD (Silero VAD for mlx) ───────────────────────────────────────
 
 def _vad_split_mlx(audio_path: str, min_segment_s: float = 1.0,
@@ -274,7 +257,6 @@ def transcribe_mlx(audio_path: str, model_name: str, language: str | None,
                    max_line_ms: int, vad: bool = False,
                    cleanup_audit: list[dict] | None = None) -> list[dict]:
     models_dir = get_model_path()
-    _migrate_model_cache(models_dir)
     os.environ["HF_HOME"] = models_dir
     os.environ["XDG_CACHE_HOME"] = str(Path(models_dir) / "cache")
 
@@ -452,8 +434,8 @@ def main():
                              "if you've verified it helps your content.")
     parser.add_argument("--engine", choices=["auto", "mlx", "faster-whisper", "groq"],
                         default="auto", help="force a specific engine")
-    parser.add_argument("--groq-api-key", default=None,
-                        help="Groq API key (required when --engine groq)")
+    parser.add_argument("--groq-api-key", default=os.environ.get("GROQ_API_KEY"),
+                        help="Groq API key (defaults to GROQ_API_KEY)")
     parser.add_argument("--vad", action="store_true", default=None,
                         help="enable VAD pre-splitting (Silero VAD for mlx, vad_filter for faster)")
     parser.add_argument("--no-vad", action="store_true", default=None,
@@ -464,6 +446,8 @@ def main():
                              "overrides the path.")
 
     args = parser.parse_args()
+    max_line_length_auto = args.max_line_length is None
+    max_line_ms_auto = args.max_line_ms is None
     if args.max_line_length is None:
         args.max_line_length = 60 if args.language == "en" else 15
     if args.max_line_ms is None:
@@ -505,6 +489,17 @@ def main():
         )
         segments = result.get("segments", [])
         top_words = result.get("words", [])
+        detected_language = result.get("language")
+        if not lang and detected_language:
+            lang = detected_language
+            print(f"groq: detected language {lang}", file=sys.stderr)
+            if args.pause_ms is None:
+                pause_threshold = get_pause_threshold(lang)
+            if lang.startswith("en"):
+                if max_line_length_auto:
+                    args.max_line_length = 60
+                if max_line_ms_auto:
+                    args.max_line_ms = 6000
         print(f"groq: {len(segments)} raw segments, {len(top_words)} word timestamps",
               file=sys.stderr)
         if not segments:

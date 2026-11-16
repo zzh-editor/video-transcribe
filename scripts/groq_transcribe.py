@@ -148,7 +148,7 @@ def _transcribe_request(
     language: str | None,
     prompt: str | None,
 ) -> dict:
-    """POST one audio file to Groq and return parsed {"segments","words"}.
+    """POST one audio file to Groq and return parsed transcript data.
 
     Transient failures (429 / 5xx / 524) are retried with backoff; auth
     failures and timeouts exit immediately. A 200 with no segments is not
@@ -230,7 +230,11 @@ def _transcribe_request(
             segments.append(entry)
 
         words = _clean_words(result.get("words", []))
-        return {"segments": segments, "words": words}
+        return {
+            "segments": segments,
+            "words": words,
+            "language": result.get("language"),
+        }
     sys.exit(1)  # unreachable, keeps flow analyzer happy
 
 
@@ -280,7 +284,11 @@ def _transcribe_single(
               file=sys.stderr)
     segments.sort(key=lambda s: s["start"])
     words.sort(key=lambda w: w["start"])
-    return {"segments": segments, "words": words}
+    return {
+        "segments": segments,
+        "words": words,
+        "language": result.get("language"),
+    }
 
 
 def transcribe_groq(

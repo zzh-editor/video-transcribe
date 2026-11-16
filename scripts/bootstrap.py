@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
-CONFIG_PATH = Path.home() / ".config" / "opencode" / "skills" / "video-transcribe" / "config.json"
+CONFIG_ENV = "VIDEO_TRANSCRIBE_CONFIG"
 
 
 def requirements_for(engine: str, system: str | None = None, machine: str | None = None):
@@ -90,14 +90,25 @@ def _make_venv(python: str, env_dir: Path) -> Path:
     return runtime
 
 
-def _resolve_engine(requested: str) -> str:
+def _resolve_engine(requested: str, config_path: str | None = None) -> str:
     if requested != "auto":
         return requested
+
+    config_path = config_path or os.environ.get(CONFIG_ENV)
+    if not config_path:
+        raise RuntimeError(
+            "未指定引擎。请传入 --engine groq/local，或设置 VIDEO_TRANSCRIBE_CONFIG。"
+        )
+
     try:
-        engine = json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("engine", "groq")
-    except (OSError, ValueError):
-        engine = "groq"
-    return engine if engine in {"groq", "local"} else "groq"
+        config = json.loads(Path(config_path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"无法读取 {CONFIG_ENV} 指定的配置文件：{exc}") from exc
+
+    engine = config.get("engine") if isinstance(config, dict) else None
+    if engine not in {"groq", "local"}:
+        raise RuntimeError(f"{CONFIG_ENV} 配置中的 engine 必须是 groq 或 local。")
+    return engine
 
 
 def prepare(engine: str) -> Path:

@@ -255,6 +255,69 @@ class TestGroqPausePropagation(unittest.TestCase):
 
 
 class TestGroqWordAdapterMainIntegration(unittest.TestCase):
+    def test_groq_api_key_comes_from_environment(self):
+        import os
+        import tempfile
+        from transcribe import main
+
+        result = {
+            "segments": [{"start": 0, "end": 1, "text": "你好"}],
+            "words": [],
+        }
+        mock_groq = MagicMock(return_value=result)
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "input.mp3"
+            output = Path(directory) / "output.srt"
+            audio.write_bytes(b"audio")
+            with patch.dict(os.environ, {"GROQ_API_KEY": "env-test-key"}), \
+                    patch.dict(sys.modules, {
+                        "groq_transcribe": MagicMock(transcribe_groq=mock_groq),
+                        "cleanup_segments": MagicMock(cleanup=MagicMock(
+                            side_effect=lambda segments, **kwargs: segments)),
+                        "groq_word_adapter": MagicMock(refine_groq_segments=MagicMock(
+                            side_effect=lambda segments, words, **kwargs: segments)),
+                    }), patch("transcribe.get_audio_duration", return_value=1), \
+                    patch("transcribe.write_srt"), patch.object(sys, "argv", [
+                        "transcribe.py", str(audio), "--engine", "groq",
+                        "--output", str(output),
+                    ]):
+                main()
+
+        self.assertEqual(mock_groq.call_args.kwargs["api_key"], "env-test-key")
+
+    def test_auto_detected_english_uses_english_segmenter(self):
+        import tempfile
+        from transcribe import main
+
+        result = {
+            "language": "en",
+            "segments": [{"start": 0, "end": 1, "text": "A sentence."}],
+            "words": [],
+        }
+        english_segments = MagicMock(
+            refine_english_segments=MagicMock(side_effect=lambda segments, *args, **kwargs: segments),
+            merge_english_fragments=MagicMock(side_effect=lambda segments, *args, **kwargs: segments),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "input.mp3"
+            output = Path(directory) / "output.srt"
+            audio.write_bytes(b"audio")
+            with patch.dict(sys.modules, {
+                "groq_transcribe": MagicMock(transcribe_groq=MagicMock(return_value=result)),
+                "english_segments": english_segments,
+                "cleanup_segments": MagicMock(cleanup=MagicMock(side_effect=lambda segments, **kwargs: segments)),
+                "audio_align": MagicMock(align_segments=MagicMock(return_value=(result["segments"], []))),
+            }), patch("transcribe.get_audio_duration", return_value=1), \
+                    patch("transcribe.write_srt"), \
+                    patch.object(sys, "argv", [
+                        "transcribe.py", str(audio), "--engine", "groq",
+                        "--groq-api-key", "fake-key", "--output", str(output),
+                    ]):
+                main()
+
+        english_segments.refine_english_segments.assert_called_once()
+        self.assertEqual(english_segments.refine_english_segments.call_args.args[2:4], (60, 6000))
+
     def test_english_punctuation_survives_entire_pipeline(self):
         import tempfile
         from transcribe import main

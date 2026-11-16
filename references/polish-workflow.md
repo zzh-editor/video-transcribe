@@ -1,59 +1,28 @@
-## 🔴 CHECKPOINT 🛑 STOP: 润色确认
+## Step 0: 润色条件问卷
 
-检查 `~/.config/opencode/skills/srt-enhancer/` 是否存在。将结果告知用户。
+本地媒体流程在转写前已经询问并记录润色选择。到此读取 `transcription_intake.polish`：
 
-srt-enhancer **不存在** → **用 Question 工具弹窗询问用户：**
-- header: "安装 srt-enhancer？"
-- description: "srt-enhancer 未安装，是否自动安装以启用润色功能？"
-- options:
-  - label: "是，安装" → description: "执行 npx skills@latest install ..."
-  - label: "否，跳过" → description: "以 raw.srt 为基线继续"
-- multiple: false
+- `false`：跳过本文件所有润色步骤，以 `raw.srt` 为基线继续；不要再问是否润色。
+- `true`：读取并使用 `transcription_intake.enhancer_preferences`，不要重复询问已回答的混排、术语括注或领域策略。
+- 没有 `transcription_intake`：表示不是本地媒体问卷路由，保留下方原有的独立确认流程。
 
-用户选「是」→ 执行 `npx skills@latest install https://github.com/zzh-editor/Srt-Enhancer`。安装成功则进入 Step 4，失败则跳过润色。
+开场问卷中若用户选择润色但当前 Agent 无法加载 `srt-enhancer`，应在开始转录前询问是否安装。用户同意后执行 `npx skills@latest install https://github.com/zzh-editor/Srt-Enhancer`，再用该 Agent 的技能加载机制确认能够加载；不假设安装器的目录布局。安装失败、仍无法加载或用户拒绝时，把 `polish` 记为 `false` 并以 `raw.srt` 为基线继续。
 
-用户选「否」→ 跳过润色，以 raw.srt 为基线继续。
+### 独立调用时的确认
 
-srt-enhancer **已存在** → **用 Question 工具弹窗询问用户：**
-- header: "调用 srt-enhancer 润色？"
-- description: "是否对原始 SRT 进行去口癖、ASR 纠错、混排规范化等润色处理？"
-- options:
-  - label: "是，调用润色" → description: "进入 Step 4 润色流程"
-  - label: "否，跳过润色" → description: "以 raw.srt 为基线继续"
-- multiple: false
+仅在没有 `transcription_intake` 时先尝试通过当前 Agent 加载 `srt-enhancer`，再用交互问答询问是否安装或调用润色，沿用原有选项：
+
+- 未安装：询问安装或跳过；用户同意后安装，失败则跳过。
+- 已安装：询问调用润色或跳过。
+- 用户跳过时，以 `raw.srt` 为基线继续。
 
 ## Step 4: [可选] 润色
 
-srt-enhancer 位于 `~/.config/opencode/skills/srt-enhancer/`，提供去口癖、ASR 纠错、的/得/地修正、标点清理、中英文混排空格规范化。
-
-### 必须执行的子步骤
-
-用 Skill 工具加载 srt-enhancer 技能后，**必须按顺序执行以下子步骤**，不可跳过：
-
-| 子步骤 | srt-enhancer 对应 | 本流程约束 | 说明 |
-|--------|-------------------|-----------|------|
-| ① 领域检测 | Step 2.5 `domain_scanner.py` | 无 | 自动检测字幕领域（Maya/Python/Gaming/AI-3D 等），为联网搜索提供 `search_context` |
-| ② AI 构建 config + 联网校准术语 | Step 3 | 无 | **必须执行联网搜索**：对 correction-table.md 未匹配的术语，用 `"{term}" + "{search_context}"` 联网校准权威写法。生成的 config 和 terminology_overrides **在对话中直接展示**（非 Question 弹窗），征询用户意见 |
-| ③ enhance.py 流水线 | Step 4 | 无（srt-enhancer 已不包含断句步骤） | 保留 normalize → terminology → spacing → finalize |
-| ④ AI 复核 + 置信度评分 | Step 5-6 | 无 | 书名号标记 + 置信度评分 |
-| ⑤ 用户确认 diff | Step 6 | 无 | 组织 diff 审核表**直接在对话中输出**（非 Question 弹窗），然后简短提问确认。用户确认后将增强结果写入 `tmp/enhanced.srt` |
-
-### 不执行的步骤
-
-- **跳过 Step 7「Generate Output File」**：输出由本流程 Step 5-7 接管
-
-### 调用模板
-
-```
-加载 srt-enhancer 技能，将 tmp/raw.srt 作为输入。必须执行：
-1. 运行 domain_scanner.py 检测领域
-2. AI 构建 config 并对未匹配术语执行联网校准
-3. 运行 enhance.py
-4. AI 复核 + 置信度评分 + diff 审核
-5. 用户确认后，将增强结果写入 tmp/enhanced.srt
-
-跳过 Step 7（Generate Output File），返回本流程。
-```
+- 前置条件：`transcription_intake.polish=true`，且当前 Agent 能加载 `srt-enhancer`。
+- 读取已加载 skill root 下的 `SKILL.md` 和 `references/caller-mode.md`，传入绝对的 `input_srt`、`output_srt`、`scratch_dir` 与问卷中的 `enhancer_preferences`。脚本路径均相对该 skill root，不推断安装目录。不要再次询问润色偏好。
+- enhancer 依自己的流程检测领域、查询术语、运行确定性流水线、展示 diff，并等待用户确认。不得绕过最终审核。
+- 读取回复末尾的 `CALLER_STATUS`。只有 `APPROVED` 或 `NO_CHANGES` 才能把 `output_srt` 用作基线；必须校验文件存在、条目数、编号和时间戳与 `raw.srt` 一致。
+- `REJECTED`、`FAILED` 或 `INVALID_CALL` 时继续使用 `raw.srt`。拒绝是用户选择，不要报告成执行失败。
 
 ## 🔴 CHECKPOINT 🛑 STOP: 润色完成验证
 
@@ -61,10 +30,9 @@ srt-enhancer 执行完毕后，**必须逐项确认以下内容**，任一项未
 
 | 验证项 | 如何确认 | 未通过处理 |
 |--------|---------|-----------|
-| 领域检测已执行 | srt-enhancer 报告了检测到的领域（如 `general`/`maya`/`python`） | 重新执行 domain_scanner.py |
-| 联网校准已执行 | diff 审核表中有「联网校准」类型的修改项，或术语表已全部匹配无需联网 | 检查 config 中 domain 是否正确，确保 search_context 非空 |
-| diff 审核表已展示 | 用户已确认或逐条审核 diff 表 | 跳过润色，以 raw.srt 为基线 |
-| tmp/enhanced.srt 存在 | `ls tmp/enhanced.srt` 成功 | 跳过润色，以 raw.srt 为基线 |
+| 领域与术语步骤已完成 | 领域报告已返回；table-match 项未联网，unmatched 项有校准结果或标记 | 发现缺项时回退到 `raw.srt` 并报告具体阶段 |
+| 审核状态有效 | `APPROVED` 或 `NO_CHANGES` | `REJECTED` 时按用户决定使用 raw.srt；`FAILED` / `INVALID_CALL` 时报告原因并回退 |
+| 输出文件有效 | `output_srt` 存在，条目数、编号和时间戳与 `raw.srt` 一致 | 回退到 `raw.srt` |
 
 确认全部通过后进入 Step 5。
 

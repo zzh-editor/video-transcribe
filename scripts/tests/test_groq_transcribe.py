@@ -175,6 +175,7 @@ class TestTranscribeGroqApiErrors(unittest.TestCase):
     @patch("groq_transcribe.requests.post")
     def test_success(self, mock_post, mock_compress):
         mock_post.return_value = self._mock_response(200, {
+            "language": "en",
             "segments": [{"start": 0, "end": 1, "text": "你好"}],
             "words": [{"word": "你好", "start": 0, "end": 1}],
         })
@@ -183,6 +184,7 @@ class TestTranscribeGroqApiErrors(unittest.TestCase):
             result = groq_transcribe.transcribe_groq(path, api_key="k")
             self.assertEqual(len(result["segments"]), 1)
             self.assertEqual(result["segments"][0]["text"], "你好")
+            self.assertEqual(result["language"], "en")
         finally:
             os.unlink(path)
 
