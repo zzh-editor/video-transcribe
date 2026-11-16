@@ -8,3 +8,4 @@ __pycache__/
 *.bak
 .agent_harnesses.json
 config.json
+.env

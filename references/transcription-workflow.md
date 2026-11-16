@@ -16,7 +16,7 @@
 
 - 翻译或双语：问目标语言；双语再问原文与译文排列顺序。
 - 选择润色：问混排规则、领域策略和术语括注。自定义规则或指定领域时同轮补问具体值；这些答案传到 `srt-enhancer`，未选择润色时不问。
-- 选择 Groq 且 `GROQ_API_KEY` 未设置：安全收集密钥，注入本次进程环境；不得在回复、命令回显或日志里显示。
+- 选择 Groq 时只读取 `GROQ_API_KEY` 环境变量。未设置时，`transcribe.py` 从技能目录 `.env` 载入该变量；两处都没有时，在 Agent 会话中请求一次，收到后自动写入技能目录 `.env` 并设为仅当前用户可读写。不要回显密钥。
 - 当前 Agent 无法加载 `srt-enhancer`：在转录前询问是否安装。用户同意后运行 `npx skills@latest install https://github.com/zzh-editor/Srt-Enhancer`，再用该 Agent 的技能加载机制验证；不假设安装目录。安装失败、仍无法加载或用户拒绝时把本次 `polish` 设为 false。
 
 ```text

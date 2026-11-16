@@ -51,6 +51,31 @@ class TestPostprocess(unittest.TestCase):
         self.assertEqual(out[0]["source_quality"]["avg_logprob"], -0.2)
 
 
+class TestGroqApiKeyLoading(unittest.TestCase):
+    def test_loads_key_from_env_file_when_environment_is_unset(self):
+        import os
+        import tempfile
+        from transcribe import _load_groq_api_key
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text("GROQ_API_KEY=test=key\n", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(_load_groq_api_key(env_file), "test=key")
+                self.assertEqual(os.environ["GROQ_API_KEY"], "test=key")
+
+    def test_environment_key_takes_precedence(self):
+        import os
+        import tempfile
+        from transcribe import _load_groq_api_key
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text("GROQ_API_KEY=file-key\n", encoding="utf-8")
+            with patch.dict(os.environ, {"GROQ_API_KEY": "environment-key"}):
+                self.assertEqual(_load_groq_api_key(env_file), "environment-key")
+
+
 class TestTimestampRounding(unittest.TestCase):
     def test_timestamp_rounds_to_integer_milliseconds(self):
         from transcribe import format_timestamp
@@ -228,12 +253,12 @@ class TestGroqPausePropagation(unittest.TestCase):
                             with patch("transcribe.detect_platform", return_value={"is_macos": True, "is_arm": True}):
                                 with patch("transcribe.write_srt"):
                                     from transcribe import main
-                                    argv = ["transcribe.py", audio, "--engine", "groq",
-                                            "--groq-api-key", "fake-key"]
+                                    argv = ["transcribe.py", audio, "--engine", "groq"]
                                     if pause_ms is not None:
                                         argv += ["--pause-ms", str(pause_ms)]
-                                    with patch.object(sys, "argv", argv):
-                                        main()
+                                    with patch.dict(os.environ, {"GROQ_API_KEY": "fake-key"}):
+                                        with patch.object(sys, "argv", argv):
+                                            main()
                                     # Check groq_pause passed to refine
                                     if mock_refine.called:
                                         actual = mock_refine.call_args.kwargs.get("pause_threshold")
@@ -255,6 +280,11 @@ class TestGroqPausePropagation(unittest.TestCase):
 
 
 class TestGroqWordAdapterMainIntegration(unittest.TestCase):
+    def setUp(self):
+        self.env_patcher = patch.dict("os.environ", {"GROQ_API_KEY": "fake-key"})
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+
     def test_groq_api_key_comes_from_environment(self):
         import os
         import tempfile
@@ -311,7 +341,7 @@ class TestGroqWordAdapterMainIntegration(unittest.TestCase):
                     patch("transcribe.write_srt"), \
                     patch.object(sys, "argv", [
                         "transcribe.py", str(audio), "--engine", "groq",
-                        "--groq-api-key", "fake-key", "--output", str(output),
+                        "--output", str(output),
                     ]):
                 main()
 
@@ -337,7 +367,7 @@ class TestGroqWordAdapterMainIntegration(unittest.TestCase):
                     patch("transcribe.get_audio_duration", return_value=4), \
                     patch.object(sys, "argv", [
                         "transcribe.py", str(audio), "--engine", "groq",
-                        "--language", "en", "--groq-api-key", "fake-key",
+                        "--language", "en",
                         "--output", str(output)]):
                 main()
             captions = parse_srt(str(output))
@@ -372,7 +402,7 @@ class TestGroqWordAdapterMainIntegration(unittest.TestCase):
                     patch("transcribe.get_audio_duration", return_value=1), \
                     patch.object(sys, "argv", [
                         "transcribe.py", str(audio), "--engine", "groq",
-                        "--language", "en", "--groq-api-key", "fake-key",
+                        "--language", "en",
                         "--output", str(output)]):
                 main()
             captions = parse_srt(str(output))
@@ -403,7 +433,7 @@ class TestGroqWordAdapterMainIntegration(unittest.TestCase):
                         from transcribe import main
                         with patch.object(sys, "argv", [
                             "transcribe.py", str(audio), "--engine", "groq",
-                            "--groq-api-key", "fake-key", "--output", str(output),
+                            "--output", str(output),
                         ]):
                             with contextlib.redirect_stderr(stderr):
                                 main()
@@ -443,7 +473,7 @@ class TestGroqWordAdapterMainIntegration(unittest.TestCase):
                         from transcribe import main
                         with patch.object(sys, "argv", [
                             "transcribe.py", str(audio), "--engine", "groq",
-                            "--groq-api-key", "fake-key", "--output", str(output),
+                            "--output", str(output),
                             "--max-line-length", "20", "--max-line-ms", "4000",
                         ]):
                             main()
@@ -474,6 +504,7 @@ class TestCleanupAuditExport(unittest.TestCase):
 
     def test_groq_main_writes_cleanup_sidecar(self):
         import json
+        import os
         import tempfile
 
         with tempfile.TemporaryDirectory() as directory:
@@ -493,11 +524,12 @@ class TestCleanupAuditExport(unittest.TestCase):
                         "is_macos": True, "is_arm": True,
                     }):
                         from transcribe import main
-                        with patch.object(sys, "argv", [
-                            "transcribe.py", str(audio), "--engine", "groq",
-                            "--groq-api-key", "fake-key", "--output", str(output),
-                        ]):
-                            main()
+                        with patch.dict(os.environ, {"GROQ_API_KEY": "fake-key"}):
+                            with patch.object(sys, "argv", [
+                                "transcribe.py", str(audio), "--engine", "groq",
+                                "--output", str(output),
+                            ]):
+                                main()
 
             audit_path = Path(str(output) + ".cleanup.json")
             audit = json.loads(audit_path.read_text(encoding="utf-8"))

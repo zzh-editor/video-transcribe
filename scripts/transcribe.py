@@ -37,6 +37,29 @@ def format_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _load_groq_api_key(env_file: Path | None = None) -> str | None:
+    if os.environ.get("GROQ_API_KEY"):
+        return os.environ["GROQ_API_KEY"]
+
+    path = env_file or Path(__file__).resolve().parent.parent / ".env"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        name, separator, value = line.partition("=")
+        if separator and name.strip() == "GROQ_API_KEY":
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if value:
+                os.environ["GROQ_API_KEY"] = value
+                return value
+            return None
+    return None
+
+
 def get_pause_threshold(language: str | None) -> float:
     if language and language.startswith(("zh", "ja", "ko")):
         return 0.3
@@ -412,6 +435,7 @@ DEFAULT_GROQ_PROMPT = None
 # ── Main ───────────────────────────────────────────────────────────
 
 def main():
+    _load_groq_api_key()
     parser = argparse.ArgumentParser(
         description="Transcribe audio to SRT using Whisper"
     )
@@ -434,8 +458,6 @@ def main():
                              "if you've verified it helps your content.")
     parser.add_argument("--engine", choices=["auto", "mlx", "faster-whisper", "groq"],
                         default="auto", help="force a specific engine")
-    parser.add_argument("--groq-api-key", default=os.environ.get("GROQ_API_KEY"),
-                        help="Groq API key (defaults to GROQ_API_KEY)")
     parser.add_argument("--vad", action="store_true", default=None,
                         help="enable VAD pre-splitting (Silero VAD for mlx, vad_filter for faster)")
     parser.add_argument("--no-vad", action="store_true", default=None,
@@ -477,13 +499,14 @@ def main():
     engine = args.engine
 
     if engine == "groq":
-        if not args.groq_api_key:
-            print("error: --groq-api-key is required when --engine groq", file=sys.stderr)
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            print("error: GROQ_API_KEY is required when --engine groq", file=sys.stderr)
             sys.exit(1)
         from groq_transcribe import transcribe_groq
         result = transcribe_groq(
             str(audio_path),
-            api_key=args.groq_api_key,
+            api_key=api_key,
             language=lang,
             prompt=args.prompt if args.prompt is not None else DEFAULT_GROQ_PROMPT,
         )

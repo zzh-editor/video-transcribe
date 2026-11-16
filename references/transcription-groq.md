@@ -1,6 +1,6 @@
 ## Groq API 转录
 
-使用 `whisper-large-v3`，请求顶层 segments 和字符级 words。密钥从 `GROQ_API_KEY` 环境变量读取，不从 Agent 客户端的用户目录读取。
+使用 `whisper-large-v3`，请求顶层 segments 和字符级 words。只读取 `GROQ_API_KEY` 环境变量；未设置时，`transcribe.py` 从技能目录 `.env` 载入同名变量。
 
 ### 准备音频
 
@@ -23,7 +23,7 @@ cp "<input>" "<output_dir>/tmp/audio.src"
   --engine groq
 ```
 
-启动命令前将密钥作为 `GROQ_API_KEY` 环境变量注入。密钥不得输出到对话、命令回显或日志；使用脚本输出中的 `Python executable` 路径。也可通过 `--groq-api-key` 显式传递，但优先使用环境变量以免密钥进入命令行历史。
+首次使用且 `GROQ_API_KEY` 未设置时，在 Agent 会话中请求密钥一次；收到后自动写入技能目录 `.env`，设为仅当前用户可读写，后续转录自动载入。密钥不得回显或写入日志。`.env` 不进入 Git；复制技能到其他设备时，需通过安全渠道随目录复制该文件。
 
 ### Groq 后处理约束
 
