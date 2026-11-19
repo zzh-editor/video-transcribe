@@ -161,6 +161,50 @@ class TestCrumbMergeGap(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["text"], "好的")
 
+    def test_vad_mode_keeps_pause_separated_ok(self):
+        # W13 gold: "一个拆解" + "OK" with a real 0.7s pause between must
+        # stay two cues; only gap≈0 mid-word fragments may glue.
+        regions = _regions((49.0, 50.7), (51.4, 52.0))
+        segs = [{"start": 47.9, "end": 50.9, "text": "我们现在需要对它做一个资产的一个拆解",
+                 "words": [{"word": "解", "start": 50.4, "end": 50.7}]},
+                {"start": 51.6, "end": 52.1, "text": "OK",
+                 "words": [{"word": "OK", "start": 51.7, "end": 52.0}]}]
+        out = _merge_fragments_groq(segs, regions=regions)
+        self.assertEqual(len(out), 2)
+
+    def test_no_vad_mode_keeps_legacy_generous_gap(self):
+        # without regions the legacy 5.0s window-bloat tolerance applies
+        segs = [self._crumb(0, 2, "好"), self._crumb(2, 4.5, "的")]
+        out = _merge_fragments_groq(segs, regions=None)
+        self.assertEqual(len(out), 1)
+
+
+class TestAnchorStartToSpeech(unittest.TestCase):
+    def _seg(self, start, first_word_start, end, text="测试字幕内容文本"):
+        return {"start": start, "end": end, "text": text,
+                "words": [{"word": "测", "start": first_word_start,
+                           "end": first_word_start + 0.3}]}
+
+    def test_start_snapped_when_window_leads_silence(self):
+        from groq_word_adapter import _anchor_start_to_speech
+        regions = _regions((50.0, 55.0))
+        seg = self._seg(48.0, 50.2, 55.0)   # window leads speech by 2.2s
+        out = _anchor_start_to_speech([seg], regions)
+        self.assertAlmostEqual(out[0]["start"], 50.1)
+
+    def test_start_kept_when_already_on_speech(self):
+        from groq_word_adapter import _anchor_start_to_speech
+        regions = _regions((50.0, 55.0))
+        seg = self._seg(50.0, 50.2, 55.0)
+        out = _anchor_start_to_speech([seg], regions)
+        self.assertEqual(out[0]["start"], 50.0)
+
+    def test_no_regions_noop(self):
+        from groq_word_adapter import _anchor_start_to_speech
+        seg = self._seg(48.0, 50.2, 55.0)
+        out = _anchor_start_to_speech([seg], None)
+        self.assertIs(out[0], seg)
+
 
 class TestShrinkWordlessStart(unittest.TestCase):
     def test_start_pulled_to_speech_onset(self):

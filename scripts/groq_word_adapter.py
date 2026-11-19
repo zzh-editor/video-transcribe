@@ -78,7 +78,12 @@ _FRAGMENT_CHAR_LIMIT = 5       # candidate crumb segment: <= 5 visible chars
 # several seconds apart because each window's start is its own silence pad.
 # Use a generous gap for crumb runs (word-level when available, window-level
 # otherwise) so the sentence can be glued back together.
+# With a VAD speech map (chunked mode) reported word gaps are real: the
+# manual gold showed W13's "一个拆解 OK" swallowed across a 0.7s pause, and
+# humans break at >=0.5s pauses. Only allow true mid-word fragments (gap≈0)
+# to glue — 0.45s sits just under the zh pause_threshold (0.3-0.5).
 _MERGE_CRUMB_GAP_S = 5.0
+_MERGE_CRUMB_GAP_VAD_S = 0.45
 # Boundary word span threshold for silence-fill detection. Groq's word
 # timestamps extend a word's span to fill silence up to the next word's
 # start, so a single CJK character can claim 7-17s. When a boundary
@@ -680,6 +685,34 @@ def _shrink_silent_edges(seg: dict, seg_words: list[dict]) -> dict:
     return out
 
 
+def _anchor_start_to_speech(segments: list[dict], regions) -> list[dict]:
+    """Snap a cue's start to its first word (minus pad) when the Groq window
+    start sits in silence while the first word sits on speech. W13 gold shows
+    human editors put start at speech onset; Groq windows lead by 0.3-2s of
+    silence padding. Only trims when VAD confirms both sides."""
+    if regions is None:
+        return segments
+    out: list[dict] = []
+    for seg in segments:
+        ws = seg.get("words") or []
+        start = seg.get("start", 0)
+        if (not ws
+                or regions.distance_to_speech(start + 0.05) <= 0.15
+                or ws[0].get("start") is None):
+            out.append(seg)
+            continue
+        first = float(ws[0]["start"])
+        if (first - start >= 0.3
+                and regions.distance_to_speech(first + 0.05) <= 0.15):
+            snapped = dict(seg)
+            snapped["start"] = first - 0.1
+            if snapped["start"] > start:  # trim leading silence only
+                out.append(snapped)
+                continue
+        out.append(seg)
+    return out
+
+
 def _deoverlap(segments: list[dict]) -> list[dict]:
     """Ensure segments do not overlap in time. Trims previous end to next start."""
     if len(segments) < 2:
@@ -1140,13 +1173,16 @@ def _merge_fragments_groq(segments: list[dict], energy=None, regions=None) -> li
         buf_words = list(seg.get("words", []))
         run = [seg]
         last = seg
+        # With a VAD map the gaps are real: only near-zero gaps (mid-word
+        # fragments) may glue; a >=0.5s pause is a sentence boundary to keep.
+        gap_limit = _MERGE_CRUMB_GAP_VAD_S if regions is not None else _MERGE_CRUMB_GAP_S
         j = i + 1
         while j < n:
             nxt = segments[j]
             nxt_text = nxt.get("text", "").strip()
             if len(nxt_text.replace(" ", "").replace("\u200b", "")) > _FRAGMENT_CHAR_LIMIT:
                 break
-            if _crumb_gap(last, nxt) > _MERGE_CRUMB_GAP_S:
+            if _crumb_gap(last, nxt) > gap_limit:
                 break
             # Crumbs cut at a word boundary need their gap back; crumbs with
             # no word timestamps are mid-word slices and must stay glued.
@@ -1350,6 +1386,8 @@ def refine_groq_segments(
     out = _deoverlap(out)
     if not _verify_segments_integrity(out, "deoverlap-1"):
         print("warning: deoverlap-1 integrity check failed", file=sys.stderr)
+    # Snap starts sitting in silence padding back to speech onset (gold W13)
+    out = _anchor_start_to_speech(out, regions)
     # Final edge shrink after merging/absorbing (merged windows can become bloated)
     # Re-assign words for the merged segments is lossy, so only shrink when we have words
     shrunk = []
