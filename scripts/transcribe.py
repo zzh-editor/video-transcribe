@@ -503,16 +503,47 @@ def main():
         if not api_key:
             print("error: GROQ_API_KEY is required when --engine groq", file=sys.stderr)
             sys.exit(1)
+
+        # Local Silero VAD speech map, built BEFORE the API call: long audio
+        # (>30 min) is transcribed in VAD chunks (one call per chunk, cut at
+        # silence gaps) per Groq's long-audio guidance, and the map also feeds
+        # hallucination cleanup and silence-aware splitting afterwards.
+        regions = None
+        vad_map = None
+        try:
+            from vad_map import SpeechRegions, build_vad_map
+            vad_map = build_vad_map(str(audio_path))
+            if vad_map:
+                regions = SpeechRegions.from_map(vad_map)
+                with open(str(output_path) + ".vad.json", "w", encoding="utf-8") as f:
+                    json.dump(vad_map, f, ensure_ascii=False, indent=1)
+                print(f"vad_map: {vad_map['duration']:.0f}s total, "
+                      f"{vad_map['speech_ratio']*100:.1f}% speech, "
+                      f"{vad_map['gap_count']} gaps >= 0.8s -> {output_path}.vad.json",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"warning: local VAD map unavailable ({e}); "
+                  "single-call upload and word-gap heuristics only", file=sys.stderr)
+
         from groq_transcribe import transcribe_groq
         result = transcribe_groq(
             str(audio_path),
             api_key=api_key,
             language=lang,
             prompt=args.prompt if args.prompt is not None else DEFAULT_GROQ_PROMPT,
+            vad_map=vad_map,
+            duration=audio_dur,
         )
         segments = result.get("segments", [])
         top_words = result.get("words", [])
         detected_language = result.get("language")
+        # Persist the raw response so post-processing changes can be re-run
+        # (python scripts + this file) without another paid API call.
+        try:
+            with open(str(output_path) + ".raw.json", "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False)
+        except OSError as e:
+            print(f"warning: raw response dump failed ({e})", file=sys.stderr)
         if not lang and detected_language:
             lang = detected_language
             print(f"groq: detected language {lang}", file=sys.stderr)
@@ -536,7 +567,8 @@ def main():
                 segments, top_words, args.max_line_length, args.max_line_ms,
                 pause_threshold=args.pause_ms / 1000 if args.pause_ms is not None else 0.8)
             segments = merge_english_fragments(segments, args.max_line_length)
-            segments = cleanup_segs(segments, audit=cleanup_audit, english=True)
+            segments = cleanup_segs(segments, audit=cleanup_audit, english=True,
+                                    regions=regions)
             # Groq word timestamps swallow the silence around a phrase (a cue
             # can sit on screen for 20s while nobody talks). Trim every cue
             # back to the speech the audio actually carries.
@@ -574,6 +606,7 @@ def main():
                 pause_threshold=groq_pause,
                 full_segment=args.full_segment,
                 audio_path=str(audio_path),
+                regions=regions,
             )
             if len(segments) != before:
                 print(f"groq_word_adapter: {before} → {len(segments)} segments "
@@ -595,7 +628,7 @@ def main():
         try:
             from cleanup_segments import cleanup as cleanup_segs
             before_c = len(segments)
-            segments = cleanup_segs(segments, audit=cleanup_audit)
+            segments = cleanup_segs(segments, audit=cleanup_audit, regions=regions)
             if len(segments) != before_c:
                 print(f"cleanup_segments: {before_c} → {len(segments)} segments (removed empty/duplicate)",
                       file=sys.stderr)

@@ -34,7 +34,7 @@
 - 领域词典：`data/jieba_domain_dict.txt`（UTF-8 userdict 格式，每行 `词语 词频 词性`；未找到时降级为默认词典并打印 warning）
 
 ### 本地模型优化（可选，失败自动降级）
-- **silero-vad-notorch**（macOS 长音频 VAD 预分片）
+- **silero-vad-notorch**（VAD 语音地图：Groq 长音频幻觉防护 + 本地引擎 VAD 预分片）
 - **onnxruntime**（VAD 推理引擎）
 - **soundfile**（macOS 音频加载，mlx 必需）
 
@@ -64,9 +64,12 @@ AI 处理完成后可清理 `tmp/` 目录。
 | `import mlx_whisper` 失败（macOS） | 运行平台对应的 setup 脚本并指定 `--engine local` | 检查 Python ≥ 3.10 且为 Apple Silicon 芯片 |
 | `from faster_whisper import WhisperModel` 失败（其他平台） | 运行平台对应的 setup 脚本并指定 `--engine local` | 检查 Python ≥ 3.10 |
 | Whisper 模型下载失败 | 检查网络、重试 | 确保网络可访问 HuggingFace，或手动下载模型至 `models/` |
-| `import silero_vad_notorch` 失败 | 不影响基础转录 | 降级为整段 Whisper 转录（无 VAD 分片） |
+| `import silero_vad_notorch` 失败 | 不影响基础转录 | 本地引擎：降级为整段 Whisper 转录（无 VAD 分片）；Groq 引擎：降级为词间隙启发式（无 VAD 语音地图） |
 | VAD 分片失败（onnxruntime 推理异常） | 跳过 VAD | 降级为整段 Whisper 转录（无 VAD 分片） |
 | VAD 分片后无有效语音段 | 检查音频是否为纯音乐/噪音 | 自动降级为整段转录 |
+| Groq 路径 VAD 地图构建失败 | 检查 `vad_map.py` 的 warning（依赖缺失/解码失败） | 跳过 `offspeech_vad` 清理与 VAD 硬切，保留词间隙启发式；长音频退回单次调用（25MB 压缩） |
+| 分片调用某片失败 | 查看该片日志；已成功片的结果保留在 raw.json 前的内存合并 | 单片失败重跑该片；VAD 不可用时自动降级单次调用 |
+| 长音频未显式传 `--language` | 半小时以上音频必须经问卷确认语种并显式传入 | 出现中文被译成英语等语言漂移时，带 `--language` 重跑 |
 | 转写内存不足 | 关闭其他应用后重试 | 确保 8GB+ RAM |
 | 当前 Agent 的技能加载机制无法加载 srt-enhancer | 本地媒体流程在开场润色问卷中询问是否安装 | 用户同意后运行安装命令并再次尝试加载；拒绝、安装失败或仍无法加载时跳过润色 |
 | srt-enhancer 安装失败 | 检查网络和 npx 是否可用 | 跳过润色，以 raw.srt 为基线 |

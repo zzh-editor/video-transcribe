@@ -16,6 +16,13 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 CONFIG_ENV = "VIDEO_TRANSCRIBE_CONFIG"
 
 
+# Optional local-VAD deps (groq hallucination guard + silence splitting).
+# Best-effort: when absent or uninstallable the pipeline degrades to the
+# word-gap heuristics instead of failing.
+_OPTIONAL_VAD = [("silero_vad_notorch", "silero-vad-notorch"),
+                 ("onnxruntime", "onnxruntime")]
+
+
 def requirements_for(engine: str, system: str | None = None, machine: str | None = None):
     system = system or platform.system()
     machine = (machine or platform.machine()).lower()
@@ -119,6 +126,12 @@ def prepare(engine: str) -> Path:
     missing = [package for module, package in requirements
                if _package_missing(sys.executable, module, package)]
     if not missing:
+        # Optional VAD deps are never installed into the system Python; hint
+        # instead. The pipeline works without them (word-gap heuristics).
+        for module, package in _OPTIONAL_VAD:
+            if _package_missing(sys.executable, module, package):
+                print(f"提示：系统 Python 缺少可选的 {package}，"
+                      "长音频 VAD 幻觉防护将降级为词间隙启发式。", file=sys.stderr)
         return Path(sys.executable)
 
     env_dir = SKILL_DIR / "venv"
@@ -134,6 +147,14 @@ def prepare(engine: str) -> Path:
                        if _package_missing(str(runtime), module, package)]
     if missing_modules:
         raise RuntimeError("安装后仍无法导入：" + ", ".join(missing_modules))
+
+    for module, package in _OPTIONAL_VAD:
+        if _package_missing(str(runtime), module, package):
+            installed = subprocess.run([str(runtime), "-m", "pip", "install", package],
+                                       capture_output=True)
+            if installed.returncode != 0 or _package_missing(str(runtime), module, package):
+                print(f"提示：{package} 安装失败，长音频 VAD 幻觉防护将降级为词间隙启发式。",
+                      file=sys.stderr)
     return runtime
 
 

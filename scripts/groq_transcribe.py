@@ -32,6 +32,9 @@ COMPRESS_MAX_ATTEMPTS = 3      # if still over after re-encode, halve bitrate
 # connection errors still fail fast.
 RETRY_ATTEMPTS = 3         # initial request + 2 retries
 RETRY_BASE_S = 1.0         # backoff: 1s, 2s
+# 429 gets extra attempts on top: chunked long-audio runs graze the free-tier
+# 20 RPM cap and one burst shouldn't kill a 48-chunk run.
+_429_EXTRA_ATTEMPTS = 4
 
 
 def _get_duration(path: str) -> float:
@@ -141,6 +144,121 @@ def _clean_words(words: list) -> list[dict]:
     return cleaned
 
 
+# ── VAD chunking for long audio ─────────────────────────────────────
+# Groq's own docs recommend splitting large audio into smaller segments
+# processed independently. Beyond the 25MB upload cap this also fixes two
+# decoding failures observed on a 68-minute single call: language drift
+# (Chinese speech transcribed as English mid-file) and decoder collapse
+# after long silences ("."-only segments, lost real speech). Chunks are cut
+# at VAD silence gaps so no word is split, each call re-anchors its own
+# decoding context, and per-call silence is near zero.
+# Groq free tier whisper-large-v3 limits: 20 RPM / 2000 RPD / 7200 audio-sec
+# per hour (console.groq.com/docs/rate-limits). A fixed inter-call pause of
+# 60/20 + margin keeps the request rate safely under RPM regardless of how
+# fast small chunks return; audio-seconds are a non-issue since VAD chunks
+# total the speech duration (~9 min for a 68-min lecture), not the file length.
+CHUNK_MIN_AUDIO_S = 1800.0   # audio longer than 30 min → chunked calls
+CHUNK_MERGE_GAP_S = 10.0      # speech regions closer than this form one chunk
+CHUNK_MAX_S = 600.0           # split chunks longer than 10 min
+CHUNK_PAD_S = 0.2             # pad around speech so onsets keep breath
+CHUNK_THROTTLE_S = 3.3        # ≥ 60s/20RPM + margin → hard-capped under RPM
+
+
+def plan_chunks(vad_map: dict, merge_gap: float = CHUNK_MERGE_GAP_S,
+                max_len: float = CHUNK_MAX_S) -> list[tuple[float, float]]:
+    """Group VAD speech regions into greedy upload chunks.
+
+    A region joins the current chunk while the inter-region gap is small
+    (prosody, not a scene break) and the chunk stays under max_len;
+    otherwise a new chunk starts. Cutting at silence gaps means no chunk
+    boundary ever falls inside speech.
+    """
+    regions = [(r["start"], r["end"]) for r in vad_map["speech"]]
+    chunks: list[tuple[float, float]] = []
+    cur_s, cur_e = None, None
+    for s, e in regions:
+        if cur_s is None:
+            cur_s, cur_e = s, e
+        elif s - cur_e < merge_gap and (e - cur_s) <= max_len:
+            cur_e = max(cur_e, e)
+        else:
+            chunks.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    if cur_s is not None:
+        chunks.append((cur_s, cur_e))
+    return chunks
+
+
+def _cut_chunk(audio_path: str, start: float, end: float, out_path: str) -> None:
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y",
+         "-ss", f"{max(0.0, start - CHUNK_PAD_S):.3f}",
+         "-to", f"{end + CHUNK_PAD_S:.3f}",
+         "-i", audio_path, "-vn", "-ar", "16000", "-ac", "1",
+         "-c:a", "libopus", "-b:a", "48K", "-vbr", "on", out_path],
+        check=True,
+    )
+
+
+def _transcribe_chunked(
+    audio_path: str,
+    api_key: str,
+    language: str | None,
+    model: str,
+    prompt: str | None,
+    vad_map: dict,
+) -> dict:
+    chunks = plan_chunks(vad_map)
+    total_speech = sum(e - s for s, e in chunks)
+    print(f"groq: chunked mode — {len(chunks)} VAD chunks, "
+          f"{total_speech/60:.1f} min speech of {vad_map['duration']/60:.0f} min audio",
+          file=sys.stderr)
+    import tempfile
+
+    all_segments: list[dict] = []
+    all_words: list[dict] = []
+    detected: str | None = None
+    t0 = time.time()
+    for i, (start, end) in enumerate(chunks, 1):
+        fd, tmp = tempfile.mkstemp(suffix=".ogg", prefix="groqchunk_")
+        os.close(fd)
+        try:
+            _cut_chunk(audio_path, start, end, tmp)
+            chunk_lang = language or detected
+            result = _transcribe_request(tmp, api_key, model, chunk_lang, prompt)
+            if detected is None and result.get("language"):
+                detected = result["language"]
+                if language is None:
+                    print(f"groq: first chunk detected language {detected}; "
+                          "locking remaining chunks to it", file=sys.stderr)
+            offset = max(0.0, start - CHUNK_PAD_S)
+            for seg in result["segments"]:
+                seg["start"] += offset
+                seg["end"] += offset
+                all_segments.append(seg)
+            for w in result["words"]:
+                w["start"] += offset
+                w["end"] += offset
+                all_words.append(w)
+            print(f"  chunk {i}/{len(chunks)} [{start:.0f}-{end:.0f}s] "
+                  f"→ {len(result['segments'])} segs", file=sys.stderr)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        if i < len(chunks):
+            time.sleep(CHUNK_THROTTLE_S)
+
+    print(f"transcription took {time.time() - t0:.1f}s "
+          f"({len(all_segments)} raw segments)", file=sys.stderr)
+    all_segments.sort(key=lambda s: s["start"])
+    all_words.sort(key=lambda w: w["start"])
+    return {
+        "segments": all_segments,
+        "words": all_words,
+        "language": language or detected,
+    }
+
+
 def _transcribe_request(
     upload_path: str,
     api_key: str,
@@ -167,8 +285,8 @@ def _transcribe_request(
     if prompt:
         data.append(("prompt", prompt))
 
-    retryable = frozenset({429, 500, 502, 503, 504, 524})
-    for attempt in range(RETRY_ATTEMPTS):
+    retryable = frozenset({500, 502, 503, 504, 524})
+    for attempt in range(RETRY_ATTEMPTS + _429_EXTRA_ATTEMPTS):
         with open(upload_path, "rb") as f:
             files = {"file": f}
             try:
@@ -197,6 +315,21 @@ def _transcribe_request(
                 print(f"error: Groq API response interrupted: {e}", file=sys.stderr)
                 sys.exit(1)
 
+        if resp.status_code == 429:
+            # Free tier is 20 RPM and chunked runs graze the cap. Groq sends
+            # retry-after on 429 — honour it, with extra attempts so a long
+            # chunked run survives a burst instead of dying at 2 retries.
+            if attempt < RETRY_ATTEMPTS + _429_EXTRA_ATTEMPTS - 1:
+                wait = float(resp.headers.get("retry-after") or RETRY_BASE_S * (attempt + 1))
+                print(f"warning: Groq rate limit (429), retrying in {wait:.0f}s "
+                      f"({attempt + 2}/{RETRY_ATTEMPTS + _429_EXTRA_ATTEMPTS})",
+                      file=sys.stderr)
+                time.sleep(wait)
+                continue
+            print("error: Groq rate limit exceeded (429) repeatedly. "
+                  "Free tier is 20 RPM; wait a minute and retry.", file=sys.stderr)
+            sys.exit(1)
+
         if resp.status_code in retryable and attempt < RETRY_ATTEMPTS - 1:
             wait = RETRY_BASE_S * (attempt + 1)
             print(f"warning: Groq API returned {resp.status_code}, "
@@ -207,9 +340,6 @@ def _transcribe_request(
 
         if resp.status_code == 401:
             print("error: Groq API key is invalid (401). Check your API key.", file=sys.stderr)
-            sys.exit(1)
-        elif resp.status_code == 429:
-            print("error: Groq rate limit exceeded (429). Try again later.", file=sys.stderr)
             sys.exit(1)
         elif resp.status_code != 200:
             print(f"error: Groq API returned {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
@@ -297,6 +427,14 @@ def transcribe_groq(
     language: str | None = None,
     model: str = "whisper-large-v3",
     prompt: str | None = None,
+    vad_map: dict | None = None,
+    duration: float | None = None,
 ) -> dict:
     audio_path = str(audio_path)
+    # Long audio: one 68-min call showed language drift (Chinese decoded as
+    # English mid-file) and decoder collapse after silences. Groq's docs
+    # recommend chunking; VAD gaps give word-safe cut points.
+    if vad_map and duration and duration > CHUNK_MIN_AUDIO_S:
+        return _transcribe_chunked(
+            audio_path, api_key, language, model, prompt, vad_map)
     return _transcribe_single(audio_path, api_key, language, model, prompt)

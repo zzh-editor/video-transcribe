@@ -93,13 +93,14 @@
 以 refine 输出的 segments 为基线，通过 cleanup_segments.py 做最终清洗：
 
 cleanup_segments.py
-  ├── 去空文本段（text.strip() == "" 直接删除，与 refine 的 `_clean_segments` 冗余兜底）
-  ├── 幻觉检测（五条规则并行；命中项写入审计 sidecar）：
+  ├── 去空文本/纯标点段（`empty_text`；`.`/`。` 等无字母数字汉字的条目 `punct_only`，长调用解码退化的产物）
+  ├── 幻觉检测（六条规则并行；命中项写入审计 sidecar）：
   │     ├── `_is_repeat_loop`：极低字符复现率/超短词汇表的 loop 判定
   │     ├── `_is_known_hallucination`：黑名单（支持空格归一化匹配）
   │     ├── `_is_dense_hallucination`：密度判定（≥15 字且时长 <1.0s 时字速 ≥15 字/s → 幻觉）
   │     ├── `_is_sparse_hallucination`：稀疏判定（时长 ≥20s 且字速 <0.5 字/s → 幻觉）
-  │     └── `_is_no_speech_hallucination`：质量指标判定（Groq verbose_json 返回的 `no_speech_prob ≥0.8` 且 `avg_logprob ≤-1.0` 时判定静默段幻觉，缺指标则跳过）
+  │     ├── `_is_no_speech_hallucination`：质量指标判定（Groq verbose_json 返回的 `no_speech_prob ≥0.8` 且 `avg_logprob ≤-1.0` 时判定静默段幻觉，缺指标则跳过）
+  │     └── `_is_offspeech_hallucination`：VAD 判定（传入 `vad_map.SpeechRegions` 时，与真实语音重叠 <0.3s 且条目中点距最近语音区 ≥2.0s（深入静默区）→ 静默窗幻觉；2.0s 容忍带吸收 Silero 对轻声语音 0.8-1.0s 的浅层漏检（W13 精校实测），真实幻觉在大 gap 中点距离为几十到几百秒；短条目同样命中；缺地图则跳过，中英文路径都生效）
   └── 合并相邻重复段（仅当文本不区分大小写相同且 `gap = cur.start - prev.end ≤ 1.0s` 时合并，跨远距重复保留）
 
 两阶段分工：预清洗处理 ASR 噪声（空/零时长），后清洗处理 VAD 边界重叠和幻觉。被删除或合并的条目会写入 `<输出srt>.cleanup.json`，包含原文本、时间、命中规则和动作，供复核与恢复；没有清理动作时 sidecar 写入空数组，避免复用输出路径时留下旧记录。
@@ -130,13 +131,16 @@ Groq `whisper-large-v3` 的 `verbose_json` 响应在顶层提供字符级 `words
 
 ### 6. 异常检测 `_is_abnormal` + 静默硬切触发 `_should_force_split`
 
-去空白字符数 > `max_chars` 或 duration（ms）> `max_line_ms` 时判定为异常；**正常段若最大词隙 `_max_internal_gap > 0.80s`（`_SILENCE_SPLIT_GAP_S`）亦判定需强制切**（实测 W6 19 处跨 1.5-16s 静默的正常段由此捕获）。异常/强制切均走 `_split_seg_with_words()`。
+去空白字符数 > `max_chars` 或 duration（ms）> `max_line_ms` 时判定为异常；正常段若最大词隙 `_max_internal_gap > 0.80s`（`_SILENCE_SPLIT_GAP_S`）亦判定需强制切（实测 W6 19 处跨 1.5-16s 静默的正常段由此捕获）。传入 VAD 语音地图（`vad_map.SpeechRegions`）时，段内 VAD gap ≥0.80s 也触发强制切——Groq 会把词 span 拉伸到填满静默，词间隙在这些位置塌缩为 0，只有 VAD 能看见真实停顿。异常/强制切均走 `_split_seg_with_words()`。
+
+VAD 硬切切点由 `_vad_split_indices` 计算：取第一个中点落在 gap 中点之后的词为右片首词，跨隙词归左片；`_split_at_silence` 把 VAD 切点与词隙切点合并去重，片间裁掉拉伸越界部分保留 150ms 间隙（`_OVERLAP_EPS_S`）。
 
 ### 7. 静默治理 `_shrink_silent_edges` / `_deoverlap` / `_absorb_isolated_crumbs`
 
 - `_shrink_silent_edges()`：双向缩首尾，仅当 `speech_span/duration < 0.4` 且省 ≥0.8s 才缩，首尾各留 `_SILENT_PAD_S=0.2s`；合并/吸收后二轮缩边 + 二轮去重叠
 - `_deoverlap()`：按 `start` 排序后，`cur.start < prev.end` 时 `prev.end = cur.start - 0.02s`（`_OVERLAP_EPS_S`），修 4 处 279-500ms 重叠
 - `_absorb_isolated_crumbs()`：`≤3 字且 >3.0s` 的孤立短词（如 OK/好）若与后段 `gap ≤0.5s` 则并入后段首部；`_merge_fragments_groq()` 合并 `≤5 字` 且词隙 `≤5.0s` 的碎片链
+- 碎片链合并时质量指标取保守值（`_conservative_quality`：`no_speech_prob` 取最小、`avg_logprob` 取最大）——真实短句与静默幻觉碎片合并后不得继承幻觉指标被误删（W13 精校对照实测案例）
 
 ### 8. 硬切优先 `_split_at_silence`
 

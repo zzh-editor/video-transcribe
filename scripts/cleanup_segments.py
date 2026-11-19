@@ -26,10 +26,12 @@ MIN_UNIQUE_CHARS_RATIO = 0.04  # unique chars / total length below this = loop
 # Known whisper hallucination phrases. Matching is normalized (spaces/zero-width
 # stripped) so Groq's spacing-free output still hits the blacklist.
 KNOWN_HALLUCINATIONS = frozenset({
-    "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目",
     # Whisper re-reads a Chinese instruction prompt aloud as hallucinated speech
-    # during silent windows. Substrings match any variant of the recurring
-    # phrase ("请准确转写专业术语．保持简体中文。" / "请准确转写专业术" etc).
+    # during silent windows. The farewell often arrives split across two cues
+    # ("请不吝点赞 订阅 转发 打赏支持" + "明镜与点点栏目"), so blacklist the
+    # halves separately — whole-phrase matching missed the split variant.
+    "请不吝点赞订阅转发打赏支持",
+    "明镜与点点栏目",
     "请准确转写专业",
     "保持简体中文",
 })
@@ -61,6 +63,17 @@ SPARSE_MAX_CHARS_PER_SEC = 0.5  # ... with density below this (chars / second)
 NO_SPEECH_PROB_THRESHOLD = 0.8   # >= this → decoder believes there's no speech
 AVG_LOGPROB_THRESHOLD = -1.0     # <= this → low decoding confidence
 MIN_HALLUC_TEXT_CHARS = 4        # ignore near-empty segments (handled elsewhere)
+
+# VAD off-speech hallucination rule. A cue deep inside a silence gap is
+# Whisper fabricating text — the classic "you" loop every 30s and the
+# "请不吝点赞订阅转发打赏" farewell复读 on long pauses. Deep-inside means:
+# almost no speech overlap AND the cue midpoint sits well away from any
+# speech region. The distance band matters: W13 精校 found real speech that
+# Silero misses lands 0.8-1.0s outside a speech region (soft speech at VAD
+# threshold boundary), while real hallucinations sit 78-369s into silence —
+# hence 2.0s. Deleted cues land in the audit sidecar for review/restore.
+OFFSPEECH_MAX_OVERLAP_S = 0.3    # speech overlap below this → candidate
+OFFSPEECH_MIN_DISTANCE_S = 2.0   # midpoint this far from any speech → deep in silence
 
 
 def _normalize_text(text: str) -> str:
@@ -167,6 +180,39 @@ def _is_no_speech_hallucination(seg: dict) -> bool:
     return True
 
 
+def _is_offspeech_hallucination(seg: dict, regions) -> bool:
+    """True when a cue sits deep inside a silence gap.
+
+    ``regions`` is a vad_map.SpeechRegions instance (or None → rule disabled).
+    Deep inside = speech overlap under threshold AND the cue midpoint at least
+    OFFSPEECH_MIN_DISTANCE_S away from any speech region. Short cues qualify
+    too (the 30s-periodic "you" loop is ~1s long); real short words always
+    hug a speech region. Language-independent, so both paths use it.
+    """
+    if regions is None:
+        return False
+    text = seg.get("text", "").strip()
+    # 3 chars lets the "you" loop through; 1-2 char fillers stay (audit
+    # trade-off: deleting a real lone "嗯" to catch nothing extra is a loss)
+    if len(_normalize_text(text)) < 3:
+        return False
+    start = seg.get("start", 0) or 0
+    end = seg.get("end", 0) or 0
+    if end <= start:
+        return False
+    if regions.overlap(start, end) >= OFFSPEECH_MAX_OVERLAP_S:
+        return False
+    return regions.distance_to_speech((start + end) / 2.0) >= OFFSPEECH_MIN_DISTANCE_S
+
+
+def _is_punct_only(text: str) -> bool:
+    """True when a cue carries no letters/digits/CJK at all (Whisper
+    degenerates to '.'-only segments after long silences in long calls)."""
+    t = text.strip()
+    return bool(t) and not any(
+        ch.isalnum() or '\u4e00' <= ch <= '\u9fff' for ch in t)
+
+
 def _record_audit(audit: list[dict] | None, seg: dict,
                   reasons: list[str], action: str) -> None:
     if audit is not None:
@@ -180,7 +226,7 @@ def _record_audit(audit: list[dict] | None, seg: dict,
 
 
 def cleanup(segments: list[dict], audit: list[dict] | None = None,
-            english: bool = False) -> list[dict]:
+            english: bool = False, regions=None) -> list[dict]:
     """Drop ASR noise and merge duplicated cues.
 
     ``english`` disables the density-based hallucination rules (dense_text,
@@ -189,17 +235,23 @@ def cleanup(segments: list[dict], audit: list[dict] | None = None,
     chars/s, so a fast but real line gets flagged, and Groq reports high
     no_speech_prob for the long silences around a short phrase — which drops
     genuine words. The blacklist and repeat-loop rules stay on for both.
+
+    ``regions`` (vad_map.SpeechRegions) enables the off-speech hallucination
+    rule for both languages — it is audio truth, not a text heuristic.
     """
     if not segments:
         return []
 
-    # Step 1: remove empty text and record each cleanup decision when requested.
+    # Step 1: remove empty / punctuation-only text and record each cleanup
+    # decision when requested.
     non_empty = []
     for seg in segments:
-        if seg.get("text", "").strip():
-            non_empty.append(seg)
-        else:
+        if not seg.get("text", "").strip():
             _record_audit(audit, seg, ["empty_text"], "removed")
+        elif _is_punct_only(seg.get("text", "")):
+            _record_audit(audit, seg, ["punct_only"], "removed")
+        else:
+            non_empty.append(seg)
     if not non_empty:
         return []
 
@@ -218,6 +270,8 @@ def cleanup(segments: list[dict], audit: list[dict] | None = None,
             reasons.append("sparse_text")
         if _is_no_speech_hallucination(seg) and not english:
             reasons.append("no_speech_metrics")
+        if _is_offspeech_hallucination(seg, regions):
+            reasons.append("offspeech_vad")
         if reasons:
             _record_audit(audit, seg, reasons, "removed")
         else:

@@ -100,6 +100,27 @@ _ABSORB_GAP_S = 0.5        # next segment starts within this = seamless
 # merging inherit these from their parent so cleanup sees them later.
 _QUALITY_KEYS = ("no_speech_prob", "avg_logprob", "compression_ratio")
 
+
+def _conservative_quality(run: list[dict]) -> dict:
+    """Quality metrics for a merged cue: take the *most speech-like* values.
+
+    A real tail glued to a silence-hallucinated neighbour must not inherit
+    the neighbour's high no_speech_prob / low avg_logprob, or cleanup deletes
+    real text (W13: "这边好像" nsp=0.04 + "嗯" nsp=0.83 merged → deleted).
+    """
+    out = {}
+    nsps = [s["no_speech_prob"] for s in run if "no_speech_prob" in s]
+    lps = [s["avg_logprob"] for s in run if "avg_logprob" in s]
+    if nsps:
+        out["no_speech_prob"] = min(nsps)
+    if lps:
+        out["avg_logprob"] = max(lps)
+    for s in run:
+        if "compression_ratio" in s:
+            out["compression_ratio"] = s["compression_ratio"]
+            break
+    return out
+
 # Single-char CJK function words that naturally attach to previous tail
 _CN_FUNCTION_WORDS = frozenset("的得地了着过吧吗呢啊呀哦")
 
@@ -587,7 +608,7 @@ def _main_speech_cluster(clusters: list[tuple[float, float]], seg_start: float) 
     return best
 
 
-def _shrink_wordless_start(seg: dict, energy: _AudioEnergy,
+def _shrink_wordless_start(seg: dict, speech_clusters,
                            min_lead: float = _ENERGY_LEAD_PAD_S) -> dict:
     """Move a word-less segment's start to the onset of its main speech
     block and pull the end back to the trailing speech offset, so both the
@@ -595,12 +616,16 @@ def _shrink_wordless_start(seg: dict, energy: _AudioEnergy,
     The start uses the main speech block (the one following the longest
     silence, avoiding the previous segment's trailing voice); the end uses
     the last speech block so no real speech is cut off.
+
+    ``speech_clusters(t0, t1)`` yields (start, end) speech blocks — either a
+    vad_map.SpeechRegions.speech_in (preferred) or the legacy
+    _AudioEnergy.speech_clusters fallback.
     """
     seg_start = seg.get("start", 0)
     seg_end = seg.get("end", 0)
     if seg_end - seg_start <= min_lead * 2:
         return seg
-    clusters = energy.speech_clusters(seg_start, seg_end)
+    clusters = speech_clusters(seg_start, seg_end)
     main = _main_speech_cluster(clusters, seg_start)
     if main is None:
         return seg
@@ -697,20 +722,50 @@ def _shrink_silent_tail(seg: dict, seg_words: list[dict]) -> dict:
     return out
 
 
+def _vad_split_indices(seg: dict, seg_words: list[dict], regions,
+                       gap_threshold: float = _SILENCE_SPLIT_GAP_S) -> list[int]:
+    """Split indices from VAD gaps that the word-gap scan misses.
+
+    Groq stretches a boundary word's span across silence up to the next word's
+    start, so words[i].start - words[i-1].end collapses to ~0 exactly where
+    a seconds-long pause sits. A VAD gap inside the segment marks the real
+    boundary; the split index is the first word whose midpoint falls after
+    the gap (midpoints are monotonic in practice).
+    """
+    if regions is None:
+        return []
+    indices: list[int] = []
+    for g0, g1 in regions.internal_gaps(seg.get("start", 0), seg.get("end", 0),
+                                         min_len=gap_threshold):
+        mid = (g0 + g1) / 2.0
+        for i in range(1, len(seg_words)):
+            if (seg_words[i]["start"] + seg_words[i]["end"]) / 2.0 > mid:
+                # A word straddling the gap midpoint belongs to the LEFT piece
+                if (seg_words[i - 1]["start"] + seg_words[i - 1]["end"]) / 2.0 <= mid:
+                    indices.append(i)
+                break
+    return indices
+
+
 def _split_at_silence(
     seg: dict,
     seg_words: list[dict],
     gap_threshold: float = _SILENCE_SPLIT_GAP_S,
+    regions=None,
 ) -> list[dict] | None:
-    """Hard split a segment at word gaps > gap_threshold. Returns None if no
-    large gap or if split would produce empty pieces. Each piece inherits
-    quality metrics and is clamped to its word span + pad."""
+    """Hard split a segment at word gaps > gap_threshold (plus VAD gaps when
+    ``regions`` is given). Returns None if no large gap or if split would
+    produce empty pieces. Each piece inherits quality metrics and is clamped
+    to its word span + pad."""
     # Find gap indices
-    gaps = []
+    gaps: list[int] = []
     for i in range(1, len(seg_words)):
         gap = seg_words[i]["start"] - seg_words[i - 1]["end"]
         if gap > gap_threshold:
             gaps.append(i)
+    # VAD gaps catch the cases word gaps miss (spans stretched over silence)
+    gaps.extend(_vad_split_indices(seg, seg_words, regions, gap_threshold))
+    gaps = sorted(set(gaps))
     if not gaps:
         return None
     # Need char-time map to slice text accurately
@@ -765,6 +820,11 @@ def _split_at_silence(
         piece["start"] = max(seg.get("start", 0), piece["start"])
         piece["end"] = min(seg.get("end", 0), piece["end"])
         if piece["end"] > piece["start"]:
+            if pieces and pieces[-1]["end"] > piece["start"]:
+                # Stretched word spans overshoot into the next piece (VAD
+                # splits have no word gap to separate them)
+                pieces[-1]["end"] = max(pieces[-1]["start"] + 0.1,
+                                         piece["start"] - _OVERLAP_EPS_S)
             pieces.append(piece)
         prev_word_idx = gap_idx
     if len(pieces) < 2:
@@ -782,6 +842,7 @@ def _split_seg_with_words(
     max_chars: int,
     max_line_ms: int,
     pause_threshold: float,
+    regions=None,
 ) -> list[dict]:
     """Try a scoring-based split using word timestamps; fall back to the
     ratio/punctuation splitter on any failure. Returns >=1 segments."""
@@ -789,7 +850,7 @@ def _split_seg_with_words(
     # produce separate subtitles even when the pre-gap chunk is short (e.g.
     # "OK" before 2s silence). Scoring engine enforces MIN_LINE_CHARS and
     # would otherwise keep them together.
-    hard = _split_at_silence(seg, seg_words, _SILENCE_SPLIT_GAP_S)
+    hard = _split_at_silence(seg, seg_words, _SILENCE_SPLIT_GAP_S, regions=regions)
     if hard is not None and len(hard) >= 2:
         # Recursively refine each hard piece with scoring for residual overlong
         refined: list[dict] = []
@@ -1020,19 +1081,22 @@ def _attach_cn_particle(segments: list[dict]) -> list[dict]:
     return out
 
 
-def _merge_fragments_groq(segments: list[dict], energy=None) -> list[dict]:
+def _merge_fragments_groq(segments: list[dict], energy=None, regions=None) -> list[dict]:
     """Merge runs of adjacent tiny segments (Groq splits a sentence into
     2-4 char crumbs spread across ~5s silence-bloated windows)."""
     if len(segments) < 2:
         return segments
 
     def _crumb_gap(prev_seg: dict, nxt_seg: dict) -> float:
-        """Distance between two candidate crumbs. Uses word timestamps when
-        both sides carry them (speech-to-speech gap), otherwise falls back to
-        the window boundary gap. When boundary word spans are abnormally large
-        (silence-filled) or either side lost its words, anchors to energy
-        speech clusters instead — the fallback-split crumbs carry no words
-        and window boundaries are seamless (0 gap) even across real silence."""
+        """Distance between two candidate crumbs. VAD speech regions are the
+        ground truth when available (Groq word spans stretch across silence
+        and window boundaries are seamless even across real pauses); then
+        word timestamps; then the RMS energy fallback; else window gap."""
+        if regions is not None:
+            p_sp = regions.speech_in(prev_seg["start"], prev_seg["end"])
+            n_sp = regions.speech_in(nxt_seg["start"], nxt_seg["end"])
+            if p_sp and n_sp:
+                return max(0.0, n_sp[0][0] - p_sp[-1][1])
         prev_words = prev_seg.get("words", [])
         nxt_words = nxt_seg.get("words", [])
         if prev_words and nxt_words:
@@ -1074,6 +1138,7 @@ def _merge_fragments_groq(segments: list[dict], energy=None) -> list[dict]:
         buf_start = seg["start"]
         buf_end = seg["end"]
         buf_words = list(seg.get("words", []))
+        run = [seg]
         last = seg
         j = i + 1
         while j < n:
@@ -1089,6 +1154,7 @@ def _merge_fragments_groq(segments: list[dict], energy=None) -> list[dict]:
                         else buf_text + nxt_text)
             buf_end = nxt["end"]
             buf_words.extend(nxt.get("words", []))
+            run.append(nxt)
             last = nxt
             j += 1
         if j - i >= 2:
@@ -1097,9 +1163,7 @@ def _merge_fragments_groq(segments: list[dict], energy=None) -> list[dict]:
                 "end": buf_end,
                 "text": buf_text,
             }
-            for k in _QUALITY_KEYS:
-                if k in last:
-                    merged[k] = last[k]
+            merged.update(_conservative_quality(run))
             if buf_words:
                 merged["words"] = buf_words
                 merged = _shrink_silent_tail(merged, buf_words)
@@ -1148,12 +1212,15 @@ def _verify_segments_integrity(segments: list[dict], context: str) -> bool:
     return True
 
 
-def _should_force_split(seg: dict, seg_words: list[dict]) -> bool:
+def _should_force_split(seg: dict, seg_words: list[dict], regions=None) -> bool:
     """Normal segment that internally spans a large silence gap should still be split."""
     if len(seg_words) < 2:
         return False
     # Only care if gap is large enough to be a paragraph pause
-    return _has_large_pause(seg_words, _SILENCE_SPLIT_GAP_S)
+    if _has_large_pause(seg_words, _SILENCE_SPLIT_GAP_S):
+        return True
+    # VAD sees pauses the stretched word spans hide (gap collapsed to ~0)
+    return bool(_vad_split_indices(seg, seg_words, regions, _SILENCE_SPLIT_GAP_S))
 
 
 def refine_groq_segments(
@@ -1164,6 +1231,7 @@ def refine_groq_segments(
     pause_threshold: float = 0.3,
     full_segment: bool = False,
     audio_path: str | None = None,
+    regions=None,
 ) -> list[dict]:
     """Refine Groq segments.
 
@@ -1174,15 +1242,25 @@ def refine_groq_segments(
     - Normal segments that internally contain a large word gap (>0.8s) are
       force-split via the scoring engine — these are the 19 silence-spanning
       cases (2-16s gaps) that previously became double-length subtitles.
+      With ``regions`` (vad_map.SpeechRegions) VAD gaps also trigger splits
+      the stretched word spans hide, and crumb merge gaps use real speech.
     - Segments WITHOUT word timestamps keep their window untouched except,
-      when ``audio_path`` is provided, their start is pulled back to the
-      main speech cluster so swallowed inter-segment silence reappears.
+      when a speech map is available (VAD preferred, RMS energy fallback),
+      their start is pulled back to the main speech cluster so swallowed
+      inter-segment silence reappears.
     - When ``full_segment`` is True every segment WITH usable word timestamps
       is passed through the scoring engine (not just abnormal ones).
     - Finally, runs of adjacent tiny crumbs are merged back together and
       overlaps are repaired.
     """
-    energy = _AudioEnergy(audio_path) if audio_path else None
+    energy = _AudioEnergy(audio_path) if audio_path and regions is None else None
+
+    def _speech_clusters(t0: float, t1: float) -> list[tuple[float, float]]:
+        if regions is not None:
+            return regions.speech_in(t0, t1)
+        if energy is not None:
+            return energy.speech_clusters(t0, t1)
+        return []
     # Pre-merge English phrase split across Groq windows (e.g. Rookie / Awards)
     # before per-segment abnormal handling, so the phrase is kept together and
     # the combined window is split with proper Chinese breaks.
@@ -1199,19 +1277,19 @@ def refine_groq_segments(
         seg_words = assigned[seg_idx]
         has_content_words = bool(seg_words)
         if not has_content_words:
-            if energy is not None:
-                out.append(_shrink_wordless_start(seg, energy))
+            if energy is not None or regions is not None:
+                out.append(_shrink_wordless_start(seg, _speech_clusters))
             else:
                 out.append(seg)
             continue
         if not _is_abnormal(seg, max_chars, max_line_ms):
             if full_segment:
                 out.extend(_inherit_quality(seg, _split_seg_with_words(
-                    seg, seg_words, max_chars, max_line_ms, pause_threshold)))
-            elif _should_force_split(seg, seg_words):
+                    seg, seg_words, max_chars, max_line_ms, pause_threshold, regions=regions)))
+            elif _should_force_split(seg, seg_words, regions):
                 # Large internal silence → must split even though char/dur are normal
                 out.extend(_inherit_quality(seg, _split_seg_with_words(
-                    seg, seg_words, max_chars, max_line_ms, pause_threshold)))
+                    seg, seg_words, max_chars, max_line_ms, pause_threshold, regions=regions)))
             else:
                 shrunk_seg = _shrink_silent_edges(seg, seg_words)
                 # Preserve word timestamps for final post-shrink/deoverlap
@@ -1219,7 +1297,8 @@ def refine_groq_segments(
                     shrunk_seg["words"] = list(seg_words)
                 out.append(shrunk_seg)
             continue
-        pieces = _split_seg_with_words(seg, seg_words, max_chars, max_line_ms, pause_threshold)
+        pieces = _split_seg_with_words(seg, seg_words, max_chars, max_line_ms,
+                                       pause_threshold, regions=regions)
         # Verify split integrity before extending; fallback to original on failure
         if not _verify_segments_integrity(pieces, f"split-seg-{seg_idx}"):
             print(f"warning: split verification failed for seg {seg_idx}, keeping original",
@@ -1235,7 +1314,7 @@ def refine_groq_segments(
         out.extend(_inherit_quality(seg, pieces))
     # Mutation exit 1: after merge fragments
     _merge_before = len(out)
-    out = _merge_fragments_groq(out, energy=energy)
+    out = _merge_fragments_groq(out, energy=energy, regions=regions)
     # Only merge English phrases when we have word timestamps to re-split
     # otherwise a no-word SRT merge (e.g. 10+21=31 chars) becomes super-long with no fallback
     if top_words:
@@ -1249,7 +1328,8 @@ def refine_groq_segments(
         if _is_abnormal(seg, max_chars + 3, max_line_ms):
             ws = seg.get("words", [])
             if ws:
-                pieces = _split_seg_with_words(seg, ws, max_chars, max_line_ms, pause_threshold)
+                pieces = _split_seg_with_words(seg, ws, max_chars, max_line_ms,
+                                               pause_threshold, regions=regions)
                 if pieces and len(pieces) > 1:
                     resplit.extend(_inherit_quality(seg, pieces))
                 else:
@@ -1258,7 +1338,7 @@ def refine_groq_segments(
             else:
                 fb = _fallback_split(seg, max_chars, max_line_ms)
                 if energy is not None:
-                    fb = [_shrink_wordless_start(p, energy) for p in fb]
+                    fb = [_shrink_wordless_start(p, _speech_clusters) for p in fb]
                 resplit.extend(_inherit_quality(seg, fb if fb else [seg]))
         else:
             resplit.append(seg)
