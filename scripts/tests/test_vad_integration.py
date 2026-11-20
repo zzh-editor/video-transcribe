@@ -224,8 +224,9 @@ class TestPlanChunks(unittest.TestCase):
                 "duration": 100.0}
 
     def test_close_regions_merge_far_apart_split(self):
-        chunks = plan_chunks(self._map((0, 5), (15.5, 18), (100, 200)))
-        self.assertEqual(chunks, [(0, 5), (15.5, 18), (100, 200)])
+        # Default policy: gaps < 300s merge, larger gaps start a new chunk.
+        chunks = plan_chunks(self._map((0, 5), (195, 200), (600, 605)))
+        self.assertEqual(chunks, [(0, 200), (600, 605)])
 
     def test_gap_under_threshold_joins(self):
         chunks = plan_chunks(self._map((0, 5), (12, 15)), merge_gap=10.0)
@@ -233,13 +234,21 @@ class TestPlanChunks(unittest.TestCase):
 
     def test_overlong_run_splits(self):
         regions = [(i * 20, i * 20 + 18) for i in range(31)]  # ~620s run, 2s gaps
-        chunks = plan_chunks(self._map(*regions))
+        # Greedy split still triggers at an explicit tighter max_len.
+        chunks = plan_chunks(self._map(*regions), max_len=600.0)
         self.assertGreater(len(chunks), 1)
         for s, e in chunks:
             self.assertLessEqual(e - s, 600.0 + 2.0)
         # chunks must stay ordered and non-overlapping
         for (s1, _), (s2, _) in zip(chunks, chunks[1:]):
             self.assertGreaterEqual(s2, s1)
+
+    def test_halfhour_cap(self):
+        # Default policy: every chunk span stays under the 30-minute cap.
+        regions = [(i * 300, i * 300 + 240) for i in range(9)]  # 42 min, 60s gaps
+        chunks = plan_chunks(self._map(*regions))
+        for s, e in chunks:
+            self.assertLessEqual(e - s, 1800.0)
 
     def test_no_chunks_inside_speech(self):
         regions = [(i * 20, i * 20 + 18) for i in range(31)]

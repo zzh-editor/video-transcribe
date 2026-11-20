@@ -122,18 +122,9 @@ def prepare(engine: str) -> Path:
     if sys.version_info < (3, 10):
         raise RuntimeError("需要 Python 3.10 或更新版本。请升级 Python 后重试。")
 
+    # 技能自包含：一律使用技能目录下的虚拟环境，不依赖也不污染系统
+    # Python 的 site-packages。首次运行时创建并装齐依赖，之后复用。
     requirements = requirements_for(engine)
-    missing = [package for module, package in requirements
-               if _package_missing(sys.executable, module, package)]
-    if not missing:
-        # Optional VAD deps are never installed into the system Python; hint
-        # instead. The pipeline works without them (word-gap heuristics).
-        for module, package in _OPTIONAL_VAD:
-            if _package_missing(sys.executable, module, package):
-                print(f"提示：系统 Python 缺少可选的 {package}，"
-                      "长音频 VAD 幻觉防护将降级为词间隙启发式。", file=sys.stderr)
-        return Path(sys.executable)
-
     env_dir = SKILL_DIR / "venv"
     runtime = _make_venv(sys.executable, env_dir)
     missing = [package for module, package in requirements
@@ -151,9 +142,15 @@ def prepare(engine: str) -> Path:
     for module, package in _OPTIONAL_VAD:
         if _package_missing(str(runtime), module, package):
             installed = subprocess.run([str(runtime), "-m", "pip", "install", package],
-                                       capture_output=True)
+                                       capture_output=True, text=True)
             if installed.returncode != 0 or _package_missing(str(runtime), module, package):
-                print(f"提示：{package} 安装失败，长音频 VAD 幻觉防护将降级为词间隙启发式。",
+                # 常见原因：执行 Python 过新（如 3.15），onnxruntime 尚无
+                # 匹配 wheel。打印 pip 错误摘要方便诊断，降级不中断。
+                err = (installed.stderr or "").strip().splitlines()
+                reason = next((l for l in err if "Could not find" in l or "No matching" in l), "")
+                print(f"提示：{package} 安装失败{('：' + reason) if reason else ''}，"
+                      "长音频 VAD 幻觉防护将降级为词间隙启发式。"
+                      "若为 Python 版本过新所致，可用 3.10-3.13 重建技能 venv。",
                       file=sys.stderr)
     return runtime
 

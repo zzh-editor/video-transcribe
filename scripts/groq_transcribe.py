@@ -150,16 +150,18 @@ def _clean_words(words: list) -> list[dict]:
 # decoding failures observed on a 68-minute single call: language drift
 # (Chinese speech transcribed as English mid-file) and decoder collapse
 # after long silences ("."-only segments, lost real speech). Chunks are cut
-# at VAD silence gaps so no word is split, each call re-anchors its own
-# decoding context, and per-call silence is near zero.
+# at VAD silence gaps so no word is split, and each call re-anchors its own
+# decoding context. Policy: half-hour chunks (每段最长不超过半小时), so a
+# 68-min lecture is 2-4 calls instead of dozens of micro-chunks. Chunk
+# interior silence returns, but the local VAD hallucination cleanup
+# (_is_offspeech_vad) still removes "."-only / drifted entries afterwards.
 # Groq free tier whisper-large-v3 limits: 20 RPM / 2000 RPD / 7200 audio-sec
 # per hour (console.groq.com/docs/rate-limits). A fixed inter-call pause of
-# 60/20 + margin keeps the request rate safely under RPM regardless of how
-# fast small chunks return; audio-seconds are a non-issue since VAD chunks
-# total the speech duration (~9 min for a 68-min lecture), not the file length.
+# 60/20 + margin keeps the request rate safely under RPM; a 30-min Opus
+# chunk at 48kbps is ~10.8MB, under the 25MB cap with margin.
 CHUNK_MIN_AUDIO_S = 1800.0   # audio longer than 30 min → chunked calls
-CHUNK_MERGE_GAP_S = 10.0      # speech regions closer than this form one chunk
-CHUNK_MAX_S = 600.0           # split chunks longer than 10 min
+CHUNK_MERGE_GAP_S = 300.0     # speech regions closer than this form one chunk
+CHUNK_MAX_S = 1800.0          # split chunks longer than 30 min (half-hour cap)
 CHUNK_PAD_S = 0.2             # pad around speech so onsets keep breath
 CHUNK_THROTTLE_S = 3.3        # ≥ 60s/20RPM + margin → hard-capped under RPM
 
@@ -190,12 +192,19 @@ def plan_chunks(vad_map: dict, merge_gap: float = CHUNK_MERGE_GAP_S,
 
 
 def _cut_chunk(audio_path: str, start: float, end: float, out_path: str) -> None:
+    # Keep every chunk under the 25MB upload cap: half an hour @48kbps is
+    # ~10.8MB so the ceiling never bites at the default 30-min chunks, but
+    # if CHUNK_MAX_S is ever raised, scale the bitrate down to fit.
+    span = end + CHUNK_PAD_S - max(0.0, start - CHUNK_PAD_S)
+    fit_kbps = int(MAX_FILE_SIZE_MB * 1024 * 1024 * COMPRESS_SAFETY * 8
+                   / max(span, 1.0) / 1000)
+    kbps = min(48, max(fit_kbps, COMPRESS_BITRATE_FLOOR_K))
     subprocess.run(
         ["ffmpeg", "-nostdin", "-v", "error", "-y",
          "-ss", f"{max(0.0, start - CHUNK_PAD_S):.3f}",
          "-to", f"{end + CHUNK_PAD_S:.3f}",
          "-i", audio_path, "-vn", "-ar", "16000", "-ac", "1",
-         "-c:a", "libopus", "-b:a", "48K", "-vbr", "on", out_path],
+         "-c:a", "libopus", "-b:a", f"{kbps}K", "-vbr", "on", out_path],
         check=True,
     )
 
@@ -421,6 +430,15 @@ def _transcribe_single(
     }
 
 
+# Chinese output drifts to Traditional characters (~1.6% of cues on a 68-min
+# lecture) unless the decoder is steered. When language=zh and the caller
+# passed no prompt, prepend the same steering sentence the local whisper
+# engines use (INITIAL_PROMPT_ZH). Hallucination risk of instruction-style
+# prompts in silent windows is mitigated by the local VAD cleanup
+# (_is_offspeech_vad); a caller-supplied --prompt is used as-is instead.
+ZH_SIMPLIFIED_PROMPT = "以下是普通话的句子，使用简体中文书写。"
+
+
 def transcribe_groq(
     audio_path: str,
     api_key: str,
@@ -431,6 +449,10 @@ def transcribe_groq(
     duration: float | None = None,
 ) -> dict:
     audio_path = str(audio_path)
+    # 中文必须显式锚定简体（ISO-639 只有 zh，无 zh-CN），否则 Groq 阶段
+    # 就会混出繁体，事后还要一轮简繁转换。
+    if language and language.startswith("zh") and not prompt:
+        prompt = ZH_SIMPLIFIED_PROMPT
     # Long audio: one 68-min call showed language drift (Chinese decoded as
     # English mid-file) and decoder collapse after silences. Groq's docs
     # recommend chunking; VAD gaps give word-safe cut points.

@@ -9,7 +9,7 @@
 └── scripts/bootstrap.py ← 跨平台依赖检测与安装
 ```
 
-Python 要求 3.10 或更新版本。依赖缺失时，bootstrap 会检查当前执行环境的 Python，优先复用依赖齐全的运行时，否则修复或创建技能虚拟环境，只安装当前引擎缺少的包。Whisper 模型约 1.6GB，首次使用时自动下载至 `models/` 目录（`HF_HOME` 指向此目录）。
+Python 要求 3.10 或更新版本。依赖**全部装进技能目录的虚拟环境**（`venv/`），不依赖也不污染系统 Python 的 site-packages：首次运行时创建并装齐当前引擎所需依赖，之后复用。执行 Python 过新导致可选 VAD 依赖（onnxruntime 等）无匹配 wheel 时会打印诊断并降级为词间隙启发式，用 3.10-3.13 的 Python 重建 venv 可恢复 VAD 防护。Whisper 模型约 1.6GB，首次使用时自动下载至 `models/` 目录（`HF_HOME` 指向此目录）。
 
 ## 引擎配置
 
