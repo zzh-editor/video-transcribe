@@ -17,7 +17,7 @@ version: 3.1.0
 
 ## Fixed Workflow
 
-Keep this order; preferences must be complete before processing, and approval before writing any enhanced output:
+Keep this order; preferences must be complete before processing, and approval before writing any enhanced output. 下面 5 步是跨文档的流程，references 用独立编号 Step 0–7.5（0 润色问卷、1 准备音频、2 转录与后处理、3 语义复核、4 润色、5 基线字幕、6 翻译、7 输出、7.5 竖屏）；references 里出现的「回到 Step 3」等指它自己的编号。
 
 1. **Collect preferences before processing.** 本地媒体先读 `references/transcription-workflow.md` 完成开场问卷（原语言、字幕版本、语义复核、润色、引擎）；显式答案直接复用，后续检查点不得重复询问。已有 `.srt` 且要求翻译：跳过环境初始化与转录，把源 SRT 复制到 `tmp/final.srt` 后进入 `references/translation-workflow.md`。已有 `.srt` 且要求润色、清理或竖屏断句：转交 `srt-enhancer`，不走本技能的 SRT 翻译入口。
 2. **Prepare engine and transcribe.** 引擎初次设置、缺依赖或切换时读 `references/environment-setup.md`。Groq 走 `references/transcription-groq.md`，本地 Whisper 走 `references/transcription-local.md`；Groq 识别为英文时读 `references/english-segmentation.md`。
