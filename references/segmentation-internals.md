@@ -138,7 +138,7 @@ VAD 硬切切点由 `_vad_split_indices` 计算：取第一个中点落在 gap �
 ### 7. 静默治理 `_shrink_silent_edges` / `_deoverlap` / `_absorb_isolated_crumbs`
 
 - `_shrink_silent_edges()`：双向缩首尾，仅当 `speech_span/duration < 0.4` 且省 ≥0.8s 才缩，首尾各留 `_SILENT_PAD_S=0.2s`；合并/吸收后二轮缩边 + 二轮去重叠
-- `_deoverlap()`：按 `start` 排序后，`cur.start < prev.end` 时 `prev.end = cur.start - 0.02s`（`_OVERLAP_EPS_S`），修 4 处 279-500ms 重叠
+- `_deoverlap()`：按 `start` 排序后，`cur.start < prev.end` 时 `prev.end = max(prev.start + 0.1, cur.start - 0.15s)`（`_OVERLAP_EPS_S`），修 4 处 279-500ms 重叠
 - `_absorb_isolated_crumbs()`：`≤3 字且 >3.0s` 的孤立短词（如 OK/好）若与后段 `gap ≤0.5s` 则并入后段首部；`_merge_fragments_groq()` 合并 `≤5 字` 碎片链——有 VAD 地图时 gap 阈值收紧为 `_MERGE_CRUMB_GAP_VAD_S=0.45s`（分片模式词隙真实，W13 精校实测 0.7s 停顿的 "OK" 被旧 5s 阈值吞并；0.45 只允许词中缝残片 glue），无 VAD 时保留 5.0s 窗口膨胀容差。完全禁用或降到 0.2s 会让 cand-only 切点暴涨（实测 41→54），0.45 为甜点
 - 碎片链合并时质量指标取保守值（`_conservative_quality`：`no_speech_prob` 取最小、`avg_logprob` 取最大）——真实短句与静默幻觉碎片合并后不得继承幻觉指标被误删（W13 精校对照实测案例）
 - `_anchor_start_to_speech()`：VAD 模式下条目 start 落在静默 pad 内（距语音 >0.15s）且第一词贴语音时，start 吸附到第一词 -0.1s；实测大 pad（0.5-3s）从 30+ 条清零，小 pad（0.15-0.5s）保守不动

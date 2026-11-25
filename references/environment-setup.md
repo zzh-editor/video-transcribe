@@ -11,6 +11,8 @@
 
 Python 要求 3.10 或更新版本。依赖**全部装进技能目录的虚拟环境**（`venv/`），不依赖也不污染系统 Python 的 site-packages：首次运行时创建并装齐当前引擎所需依赖，之后复用。执行 Python 过新导致可选 VAD 依赖（onnxruntime 等）无匹配 wheel 时会打印诊断并降级为词间隙启发式，用 3.10-3.13 的 Python 重建 venv 可恢复 VAD 防护。Whisper 模型约 1.6GB，首次使用时自动下载至 `models/` 目录（`HF_HOME` 指向此目录）。
 
+若 shell 设了 `ALL_PROXY` / `all_proxy`（socks5），本地引擎首次加载会在 `httpx` 处抛 `ImportError: Using SOCKS proxy, but the 'socksio' package is not installed`——依赖装齐了也会失败。在技能 venv 里 `pip install "httpx[socks]"`，或运行转录前 `unset ALL_PROXY all_proxy`。
+
 ## 引擎配置
 
 可选配置文件路径由 `VIDEO_TRANSCRIBE_CONFIG` 环境变量显式提供。未设置时不读取或写入客户端配置；本次任务所需引擎从问卷答案传入。

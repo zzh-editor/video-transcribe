@@ -33,7 +33,7 @@ pre-merge → `_assign_words_to_segments` → abnormal（char/dur 超标）走 `
 3. `transcribe_mlx/faster` 内部完成首轮切分，words 内嵌在 segment 里（`words` 字段直接可用）。
 4. 导出 `.words.json` + 写 SRT。
 
-本地路径**不经过** `refine` / `cleanup`（mlx/faster 引擎内部已做段落切分）。这是与 Groq 路径的最大差异：Groq 依赖 adapter 的 jieba+评分二次切分，本地靠引擎内嵌 words 直接出稿。
+本地路径同样经过 `refine` / `cleanup`：`transcribe_mlx` / `transcribe_faster` 返回前都调用 `_postprocess`，内部执行 `refine_segments` 与 `cleanup_segments`。与 Groq 的差异只在断句来源：Groq 用 adapter 的 jieba+评分二次切分，本地用引擎内嵌 words 做停顿与长度切分。
 
 ## 已知限制与对应修复（本轮改动摘要）
 

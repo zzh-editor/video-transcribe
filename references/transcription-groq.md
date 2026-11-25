@@ -80,7 +80,7 @@ Groq 官方文档明确建议大音频分片（chunking）后独立处理再合�
 - API 服务端处理 VAD，不做本地分片；本地 VAD 仅做后处理语音地图（见上文"本地 VAD 语音地图"）。
 - 中文 words 为字符级，由 `groq_word_adapter.py` 用 jieba 聚词。
 - 中文异常段按 `char_count > max_chars` 或 `duration > max_line_ms` 切分；正常段在词间隙 **≥0.80s** 或 VAD gap ≥0.80s 时强制切分，否则只收缩静默边界。静默边缘在局部能量比低于 0.4 且可收缩至少 0.8s 时调整；首尾 padding 为 0.2s；有 VAD 地图时 wordless 段直接用语音区间定位主语音块，不再走能量扫描。
-- `_deoverlap()` 修正相邻条目重叠，保留 20ms 安全间隙；`_absorb_isolated_crumbs()` 只把无缝衔接的孤立短词吸收到邻段，不跨明显停顿。
+- `_deoverlap()` 修正相邻条目重叠，保留 150ms 安全间隙（`groq_word_adapter.py` 的 `_OVERLAP_EPS_S = 0.15`）；`_absorb_isolated_crumbs()` 只把无缝衔接的孤立短词吸收到邻段，不跨明显停顿。
 - 缺失 words、时间无效或覆盖率不足时按 segment 回退，不能伪造词级时间。
 - `--full-segment` 是 Groq 专用调试选项，会对所有 segments 强制评分重切；默认不要启用，A/B 比较时才临时使用并验证。
 - 响应形状为 `{segments, words}`；word timestamps 是顶层字符级数据，不嵌在 segment 中。

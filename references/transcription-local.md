@@ -35,7 +35,8 @@ ffmpeg -i "<input>" -vn -ar 16000 -ac 1 "<output_dir>/tmp/audio.wav"
 "<PYTHON_EXECUTABLE>" scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --output "<output_dir>/tmp/raw.srt" --language zh --no-vad
 
-# 自定义断句停顿阈值（本地中文 300ms / 英文 500ms）
+# 自定义断句停顿阈值：仅 Groq 路径生效（本地中文默认 300ms / 英文 500ms 由 refine_segments 内部规则决定）
+# 本地 mlx/faster 引擎会接收 --pause-ms 但不使用，改它不会改变本地产出的断句
 "<PYTHON_EXECUTABLE>" scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --output "<output_dir>/tmp/raw.srt" --language zh --pause-ms 500
 
