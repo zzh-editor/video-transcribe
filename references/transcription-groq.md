@@ -4,10 +4,11 @@
 
 ### 准备音频
 
-Groq 支持且不超过 25MB 的文件原样上传；超限或不支持的格式才转成 16kHz 单声道 Opus/OGG。不要手动有损转码以规避大小限制。
+Groq 支持且不超过 25MB 的文件原样上传；超限或不支持的格式才转成 16kHz 单声道 Opus/OGG。不要手动有损转码以规避大小限制。复制时保留原扩展名：`_can_upload_as_is` 按后缀判断，改成 `.src` 这类未知后缀会让小文件也被强制转码（实测 3.8MB 的 wav 走了 Opus）。
 
 ```bash
-cp "<input>" "<output_dir>/tmp/audio.src"
+ext="${input##*.}"
+cp "<input>" "<output_dir>/tmp/groq_input.${ext}"
 ```
 
 文件超过 **25MB** 时，`_compress_audio` 按时长推算 16–128kbps 码率并自动压缩；超限时最多减半码率重编 3 次。
@@ -25,6 +26,8 @@ Groq 官方文档明确建议大音频分片（chunking）后独立处理再合�
 - 半小时一片且每片强制 ≤25MB（`_cut_chunk` 按跨度自适应码率，默认 48kbps 时 30 分钟 ≈ 10.8MB，留足余量），一个 68 分钟音频只要 2-4 次调用；片内会包含长静默，静默幻觉由转录后的本地 VAD 幻觉清理兜底（见下节）
 - word/segment 时间戳按片偏移回填全局时间轴；片间节流 3.3s 保 RPM
 - VAD 不可用时降级为单次调用（25MB 压缩路径不变）
+
+上限只在 VAD 语音区段之间判断：`plan_chunks` 只在两段语音的间隔处开新片，一整段不间断的语音即使超过 30 分钟也不会被切开（实测 30.7 分钟连续语音仍切 1 片上传）。这种素材仍有语言漂移风险，需要先手动切成 ≤30 分钟的片段再走本流程。
 
 ### 本地 VAD 语音地图（长音频幻觉防护）
 
@@ -67,7 +70,7 @@ Groq 官方文档明确建议大音频分片（chunking）后独立处理再合�
 用户选择自动识别时省略 `--language`；半小时以上的长音频必须通过问卷确认语种并显式传入，否则可能语言漂移（见上文"长音频分片调用"）。传 `--language zh` 时若未另传 `--prompt`，会自动附加简体引导句（`ZH_SIMPLIFIED_PROMPT`），在 Groq 阶段锚定简体输出，避免事后简繁转换。API 返回的识别语种会决定后处理分支和默认断句参数。
 
 ```bash
-"<PYTHON_EXECUTABLE>" scripts/transcribe.py "<output_dir>/tmp/audio.src" \
+"<PYTHON_EXECUTABLE>" scripts/transcribe.py "<output_dir>/tmp/groq_input.<ext>" \
   --output "<output_dir>/tmp/raw.srt" \
   --language en --max-line-length 60 --max-line-ms 6000 \
   --engine groq

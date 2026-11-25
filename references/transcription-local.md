@@ -28,6 +28,8 @@ ffmpeg -i "<input>" -vn -ar 16000 -ac 1 "<output_dir>/tmp/audio.wav"
 
 ```bash
 # 强制启用 VAD（≥10 分钟长音频建议开启，<10 分钟自动关闭）
+# 短音频里若含长静默（尾部补白、段间停顿），默认不开 VAD 会在静默区出幻觉：
+# 实测 88s 人声 + 60s 静默，默认跑出 6 条假条目，加 --vad 后为 0
 "<PYTHON_EXECUTABLE>" scripts/transcribe.py "<output_dir>/tmp/audio.wav" \
   --output "<output_dir>/tmp/raw.srt" --language zh --vad
 
